@@ -1,5 +1,9 @@
 # Changelog
 
+## UNRELEASED
+
+- **Fix: forward token prices to bridged models** — Use pi-ai's Anthropic catalog rates, including cache read/write prices and pricing tiers, and retain one-hour cache-write usage for reference cost estimates on normal responses, not Claude Code subscription charges. Cache lifetime metadata remains withheld: Pi's replay-based cache warming is covered by an offline runtime contract test, but bridge refresh support has not been validated.
+
 ## 0.9.3 — 2026-10-13
 
 - **Remove: compaction and branch-summary takeovers (#189)** — pi runs them natively; the bridge routes summary calls to its isolated path. Other compaction extensions should now work. Resolves #115. Thanks @sonSunnoi.

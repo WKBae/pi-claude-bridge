@@ -17,7 +17,8 @@ const EXTRA = { plan: "pro", longContextExtraUsage: true };
 // Simulated pi-ai registry entry — extra fields mimic the ones pi-ai exposes
 // that must not leak into the provider-registered MODELS array.
 const mockPiAiModel = (id, extra = {}) => ({
-	id, name: id, reasoning: true, input: ["text"], cost: { input: 1, output: 1 },
+	id, name: id, reasoning: true, input: ["text"], cost: { input: 1, output: 1, cacheRead: 0.1, cacheWrite: 1.25 },
+	promptCache: { short: 300, long: 3600 },
 	contextWindow: 200000, maxTokens: 8000,
 	// Leaky fields that should be stripped by the projection:
 	baseUrl: "https://api.anthropic.com", api: "anthropic", provider: "anthropic",
@@ -31,14 +32,18 @@ const find = (models, id) => models.find((m) => m.id === id);
 
 describe("MODELS projection", () => {
 	it("driven by pi-ai's real anthropic catalog, minus dated snapshot aliases", () => {
-		const models = buildModels(getModels("anthropic"));
+		const catalog = getModels("anthropic");
+		const models = buildModels(catalog);
 		for (const m of models) {
 			assert.doesNotMatch(m.id, /-20\d{6}$/, "no dated snapshot ids in the picker");
 			assert.equal(m.baseUrl, undefined);
 			assert.equal(m.api, undefined);
 			assert.equal(m.provider, undefined);
 			assert.equal(m.headers, undefined);
-			assert.deepEqual(m.cost, { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
+			const source = catalog.find((catalogModel) => catalogModel.id === m.id);
+			assert.ok(source, `${m.id} exists in the Anthropic catalog`);
+			assert.deepEqual(m.cost, source.cost, `${m.id} keeps catalog token prices`);
+			assert.equal(m.promptCache, undefined, `${m.id} does not opt into cache warming`);
 		}
 		// Spot-check coverage of every current family.
 		assert.ok(find(models, "claude-opus-5"), "opus-5 present");
@@ -74,6 +79,13 @@ describe("MODELS projection", () => {
 	it("forwards undefined thinkingLevelMap unchanged (no fabricated defaults)", () => {
 		const models = buildModels([mockPiAiModel("claude-haiku-4-5")]);
 		assert.equal(find(models, "claude-haiku-4-5")?.thinkingLevelMap, undefined);
+	});
+
+	it("forwards cost tiers but withholds cache lifetimes", () => {
+		const cost = { input: 1, output: 2, cacheRead: 0.1, cacheWrite: 1.25, tiers: [{ inputTokensAbove: 100000, input: 3, output: 4, cacheRead: 0.3, cacheWrite: 3.75 }] };
+		const [model] = buildModels([mockPiAiModel("claude-haiku-4-5", { cost })]);
+		assert.deepEqual(model.cost, cost);
+		assert.equal(model.promptCache, undefined);
 	});
 });
 

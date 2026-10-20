@@ -99,6 +99,45 @@ describe("updateUsage", () => {
 		assert.equal(output.usage.cost.total, 210);
 	});
 
+	it("prices mixed cache writes and preserves the one-hour subset across partial frames", () => {
+		const output = emptyOutput();
+		const priced = { ...pricedModel, cost: { input: 1_000_000, output: 2_000_000, cacheRead: 0, cacheWrite: 1_250_000 } };
+		updateUsage(output, {
+			input_tokens: 10, output_tokens: 20, cache_creation_input_tokens: 100,
+			cache_creation: { ephemeral_1h_input_tokens: 40 },
+		}, priced);
+		assert.equal(output.usage.cacheWrite, 100);
+		assert.equal(output.usage.cacheWrite1h, 40);
+		assert.equal(output.usage.totalTokens, 130, "one-hour writes are already in cacheWrite");
+		assert.equal(output.usage.cost.cacheWrite, 60 * 1.25 + 40 * 2);
+		assert.equal(output.usage.cost.total, 10 + 20 * 2 + 155);
+
+		for (const frame of [{ output_tokens: 30 }, { cache_creation: null }, { cache_creation: { ephemeral_1h_input_tokens: null } }]) {
+			updateUsage(output, frame, priced);
+			assert.equal(output.usage.cacheWrite1h, 40);
+			assert.equal(output.usage.totalTokens, 140);
+			assert.equal(output.usage.cost.cacheWrite, 155);
+			assert.equal(output.usage.cost.total, 10 + 30 * 2 + 155);
+		}
+
+		updateUsage(output, { cache_creation: { ephemeral_1h_input_tokens: 0 } }, priced);
+		assert.equal(output.usage.cacheWrite1h, 0, "explicit zero replaces the subset");
+		assert.equal(output.usage.cost.cacheWrite, 125);
+		assert.equal(output.usage.cost.total, 195);
+		assert.equal(output.usage.totalTokens, 140);
+	});
+
+	it("keeps the one-hour subset within a smaller replacement cache-write total", () => {
+		const output = emptyOutput();
+		updateUsage(output, { cache_creation_input_tokens: 100, cache_creation: { ephemeral_1h_input_tokens: 40 } }, model);
+		updateUsage(output, { cache_creation_input_tokens: 10 }, model);
+		assert.equal(output.usage.cacheWrite1h, 10);
+		assert.equal(output.usage.totalTokens, 10);
+		updateUsage(output, { cache_creation_input_tokens: 0 }, model);
+		assert.equal(output.usage.cacheWrite1h, 0);
+		assert.equal(output.usage.totalTokens, 0);
+	});
+
 	it("reports the thinking count carried by this frame", () => {
 		const output = emptyOutput();
 		const report = updateUsage(output, { output_tokens: 100, output_tokens_details: { thinking_tokens: 40 } }, model);

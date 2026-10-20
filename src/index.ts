@@ -1,7 +1,7 @@
 import { createAssistantMessageEventStream, type AssistantMessage, type AssistantMessageEventStream, type Context, type ImageContent, type Model, type SimpleStreamOptions, type TextContent, type Tool, type UserMessage } from "@earendil-works/pi-ai";
 import { getModels } from "@earendil-works/pi-ai/compat";
 import { buildSessionContext, keyHint, type ExtensionAPI, type ExtensionContext, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
-import { query, type EffortLevel, type SDKMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
+import { query, type EffortLevel, type SDKMessage, type SDKUserMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
 import type { Base64ImageSource, ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { Text } from "@earendil-works/pi-tui";
 import { createSession, deleteSession, openSession, repairToolPairing } from "cc-session-io";
@@ -20,6 +20,7 @@ import {
 	collectPromptSkills,
 	projectPromptCapture,
 	sharedPromptCaptures,
+	unsendableFindings,
 	type PromptCapture,
 } from "./prompt-capture.js";
 import { collectCarriedAttachments, placeCarriedAttachments, type CarriedAttachment } from "./attachments.js";
@@ -542,9 +543,60 @@ async function reportHeldRateLimit(c: QueryContext, model: Model<any>): Promise<
 	}
 }
 
-function isolatedStreamFn(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
+/** Who is calling the isolated path. `summary` serves pi's own summarizers, whose
+ *  context must be exactly `[system,user]`; `one-shot` serves an extension asking the
+ *  model a question on its own, which sends only user messages and may attach images. */
+type IsolatedRunMode = "summary" | "one-shot";
+
+/** An extension calling the model outside any pi agent turn, either to ask one question
+ *  or as one step of a tool loop it runs itself, calling back with the tool results it
+ *  gathered. The prompt is the extension's own, so no capture boundary recorded it and
+ *  projection has nothing to forward: without this route the call fails with
+ *  "prompt-capture: no capture".
+ *
+ *  Each condition is what keeps a real turn off this route rather than a guess about the
+ *  caller. The provider's `streamSimple` receives the session pi opened for the turn, so a
+ *  call without one is not part of a pi conversation; an unresolvable prompt is exactly
+ *  the case the live path cannot serve; and a tool result some live query is parked on
+ *  belongs to that query, whatever prompt arrives with it.
+ *
+ *  A prompt carrying pi's own harness is refused here rather than forwarded: the live path
+ *  reaches it through `projectPromptCapture`, whose sendability check would reject it, and
+ *  this route must not become the way that text gets out. It stays on the live path,
+ *  which fails it loudly with the diagnostic instead of a 400 or an extra-usage bill. */
+function isOutOfBandCall(context: Context, options: SimpleStreamOptions | undefined): boolean {
+	if (options?.sessionId) return false;
+	if (!context.systemPrompt) return false;
+	if (context.messages.length === 0) return false;
+	if (unsendableFindings(context.systemPrompt, "this prompt").length > 0) return false;
+	if (promptCaptures.canResolve(context.systemPrompt)) return false;
+	if (activeQueryContexts.size > 0) {
+		const { results } = _extractAllToolResults(context.messages as unknown as Array<{ role: string; [key: string]: unknown }>);
+		if (results.length > 0 && contextForToolResults(results)) return false;
+	}
+	return true;
+}
+
+/** An out-of-band call that asks one question: no tools to serve and no reply of the
+ *  model's to continue from. It runs as a one-shot; anything else runs as a step. */
+function isOneShotShape(context: Context): boolean {
+	return (context.tools?.length ?? 0) === 0 && context.messages.every((message) => message.role === "user");
+}
+
+/** Streaming input is the only way the SDK takes image blocks; one message is enough for
+ *  a single-turn one-shot, and `maxTurns: 1` ends the run when it is consumed. */
+async function* oneShotUserMessage(blocks: ContentBlockParam[]): AsyncGenerator<SDKUserMessage> {
+	yield userMessage(blocks as SDKUserMessage["message"]["content"]);
+}
+
+function isolatedStreamFn(
+	model: Model<any>,
+	context: Context,
+	options?: SimpleStreamOptions,
+	mode: IsolatedRunMode = "summary",
+): AssistantMessageEventStream {
 	const stream = createAssistantMessageEventStream();
-	void runIsolatedSummary(model, context, options, stream);
+	void runIsolatedSummary(model, context, options, stream, mode);
 	return stream;
 }
 
@@ -553,6 +605,7 @@ async function runIsolatedSummary(
 	context: Context,
 	options: SimpleStreamOptions | undefined,
 	stream: AssistantMessageEventStream,
+	mode: IsolatedRunMode = "summary",
 ): Promise<void> {
 	// pi delivers compaction/branch-summary requests as a transcript: the summarization
 	// prompt folded into a leading system message ahead of the lone user message
@@ -567,27 +620,48 @@ async function runIsolatedSummary(
 		try { sdkQuery?.close(); } catch {}
 	};
 
+	// Names this run's debug lines and CLI log files: a summarizer run and a one-shot are
+	// told apart in the log without reading the prompt.
+	const logLabel = mode === "one-shot" ? "one-shot" : "compact summary";
+
 	try {
 		// One-off summarizer calls (compaction, branch summary, turn prefix, bug report —
 		// anything routed through pi's completeSummarization) are marked cacheRetention:
 		// "none". Any of them may appear in a future pi release without a bridge change,
 		// so route on the marker, not on which summarizer is calling. Non-summarizer calls
-		// must still match the [system,user] compaction shape exactly.
+		// must still match the [system,user] compaction shape exactly. A one-shot caller
+		// answers its own question rather than summarizing a transcript, so its turn is
+		// read leniently instead: a follow-up may re-send the original message
+		// ahead of the new question, exactly the `[user, user]` shape that strict check
+		// rejects.
 		const isOneOffSummary = options?.cacheRetention === "none";
-		const promptText = isOneOffSummary
+		const lenient = isOneOffSummary || mode === "one-shot";
+		const promptText = lenient
 			? extractUserPrompt(context.messages)
 			: extractIsolatedSummaryPrompt(context.messages);
-		if (!promptText) throw new Error("runIsolatedSummary: one-off summary without a user prompt (last message is not user?)");
+		// A one-shot caller can attach screenshots to its own question, and a string
+		// prompt cannot carry them; summarizers never attach any. Read before the guard:
+		// an image with no caption is a legitimate question, and only the blocks carry it.
+		// The extractor returns null unless it saw an image, so a non-null list has blocks.
+		const promptBlocks = mode === "one-shot" ? extractUserPromptBlocks(context.messages) : null;
+		if (!promptText && !promptBlocks) {
+			throw new Error(`runIsolatedSummary: ${logLabel} was called without a user prompt to answer`);
+		}
+		const prompt: string | AsyncIterable<SDKUserMessage> = promptBlocks ? oneShotUserMessage(promptBlocks) : (promptText as string);
+		// A one-shot has no session to name a directory, so this falls back to the host's
+		// own cwd: the session's directory under the pi CLI, but a multi-session host's
+		// directory elsewhere, which is where CC runs and where ".pi/claude-bridge.json"
+		// is read. Settings and tools are empty here, so that is the only thing it decides.
 		const cwd = sessionCwdFor(summarySessionFor(options?.signal) ?? options?.sessionId);
 		const compactProviderSettings = loadConfig(cwd).provider;
 		const claudeExecutable = compactProviderSettings?.pathToClaudeCodeExecutable;
 		const cliModel = claudeCodeModelId(model, longContextSettings);
 		// Honour the caller's reasoning level, same mapping as the provider path.
 		const effort = effortForReasoning(model, options?.reasoning);
-		debug(`compact summary: spawn model=${cliModel} registeredModel=${model.id} effort=${effort ?? "default"} promptLen=${promptText.length}`);
+		debug(`${logLabel}: spawn model=${cliModel} registeredModel=${model.id} effort=${effort ?? "default"} promptLen=${promptText?.length ?? 0} blocks=${promptBlocks?.length ?? 0} images=${promptBlocks?.filter((block) => block.type === "image").length ?? 0}`);
 
 		sdkQuery = queryImpl({
-			prompt: promptText,
+			prompt,
 			options: {
 				cwd,
 				env: { ...process.env, ...CC_CHILD_ENV },
@@ -602,7 +676,7 @@ async function runIsolatedSummary(
 				maxTurns: 1,
 				...(effort ? { effort } : {}),
 				...(claudeExecutable ? { pathToClaudeCodeExecutable: claudeExecutable } : {}),
-				...makeCliDebugOptions("compact-summary"),
+				...makeCliDebugOptions(mode === "one-shot" ? "one-shot" : "compact-summary"),
 			},
 		});
 
@@ -614,11 +688,12 @@ async function runIsolatedSummary(
 		let assistantText = "";
 		let finalText = "";
 		let errorText: string | undefined;
+		let resultUsage: SdkUsage | undefined;
 		let firstEventLogged = false;
 
 		for await (const message of sdkQuery) {
 			if (!firstEventLogged) {
-				debug(`compact summary: first event type=${message.type}`);
+				debug(`${logLabel}: first event type=${message.type}`);
 				firstEventLogged = true;
 			}
 			if (wasAborted) break;
@@ -628,7 +703,8 @@ async function runIsolatedSummary(
 					if (block.type === "text" && typeof block.text === "string") assistantText += block.text;
 				}
 			} else if (message.type === "result") {
-				logServedContextWindow("compact summary", message, model);
+				logServedContextWindow(logLabel, message, model);
+				resultUsage = (message as { usage?: SdkUsage }).usage;
 				errorText = resultErrorText(message);
 				if (!errorText && message.subtype === "success") finalText = message.result || assistantText;
 			}
@@ -636,32 +712,204 @@ async function runIsolatedSummary(
 
 		if (wasAborted) {
 			const output = newAssistantOutput(model, "", "aborted", "Operation aborted");
-			debug("compact summary: aborted");
+			debug(`${logLabel}: aborted`);
 			stream.push({ type: "error", reason: "aborted", error: output });
 			stream.end();
 			return;
 		}
 
+		// A one-shot caller shows the usage its answer cost, so this fills the counters
+		// from the result frame instead of leaving them zero as the summary path does.
+		const usageFrame = mode === "one-shot" ? (resultUsage as SdkUsage | undefined) : undefined;
+
 		const text = finalText || assistantText;
 		if (errorText || !text.trim()) {
-			const msg = errorText ?? "Claude Code summary returned empty text";
-			debug(`compact summary: error ${msg}`);
+			const msg = errorText ?? (mode === "one-shot" ? "Claude Code returned empty text" : "Claude Code summary returned empty text");
+			debug(`${logLabel}: error ${msg}`);
 			stream.push({ type: "error", reason: "error", error: newAssistantOutput(model, "", "error", msg) });
 			stream.end();
 			return;
 		}
 
-		debug(`compact summary: done textLen=${text.length}`);
-		stream.push({ type: "done", reason: "stop", message: newAssistantOutput(model, text, "stop") });
+		const output = newAssistantOutput(model, text, "stop");
+		if (usageFrame) recordUsage(output, usageFrame, model);
+		debug(`${logLabel}: done textLen=${text.length}`);
+		stream.push({ type: "done", reason: "stop", message: output });
 		stream.end();
 	} catch (err) {
 		const msg = errorMessage(err);
-		debug("runIsolatedSummary threw; pushing terminal error", err);
+		debug(`${logLabel}: threw; pushing terminal error`, err);
 		stream.push({ type: "error", reason: "error", error: newAssistantOutput(model, "", "error", msg) });
 		stream.end();
 	} finally {
 		options?.signal?.removeEventListener("abort", onAbort);
 		try { sdkQuery?.close(); } catch {}
+	}
+}
+
+/** The prompt an out-of-band step opens with when its context ends at tool results.
+ *  The imported history already carries the results after the calls they answer, and
+ *  Claude Code takes a turn only from a user message. */
+const CONTINUE_AFTER_TOOL_RESULTS_PROMPT =
+	"[The tool results above answer your tool calls. Continue the task from there.]";
+
+/** A step ends at the first turn that calls a served tool, so further turns only come
+ *  from Claude Code answering calls to tool names the caller never offered. This bounds
+ *  a model that keeps making them; the step then fails with CC's max-turns result. */
+const OUT_OF_BAND_STEP_MAX_TURNS = 4;
+
+function outOfBandStepStreamFn(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
+	const stream = createAssistantMessageEventStream();
+	void runOutOfBandStep(model, context, options, stream);
+	return stream;
+}
+
+/** One model turn of an extension's own tool loop. The caller holds the conversation,
+ *  runs the tools and calls back with their results, so each call is a stateless step:
+ *  the history before the current turn goes into a throwaway Claude Code session, the
+ *  caller's tools are served over MCP, and the step ends with the model's answer or with
+ *  the tool calls it made, which go back to the caller unanswered.
+ *
+ *  Nothing here is shared with pi's own turns. The query context is private, so
+ *  `contextForToolResults` never routes a result to it; no session mirror is read or
+ *  written; and the session file is deleted when the step ends. */
+async function runOutOfBandStep(
+	model: Model<any>,
+	context: Context,
+	options: SimpleStreamOptions | undefined,
+	stream: AssistantMessageEventStream,
+): Promise<void> {
+	const queryCtx = new QueryContext();
+	queryCtx.currentPiStream = stream;
+	queryCtx.currentOnResponse = options?.onResponse;
+	queryCtx.resetTurnState(model);
+	// The one-shot's directory rule: with no session to name one, the host's own cwd.
+	// The session file is written under it, so CC must run there to resume it.
+	const cwd = sessionCwdFor(summarySessionFor(options?.signal) ?? options?.sessionId);
+	const claudeDir = process.env.CLAUDE_CONFIG_DIR;
+	let sdkQuery: ReturnType<typeof query> | undefined;
+	let sessionId: string | undefined;
+	let wasAborted = false;
+	const closeQuery = () => {
+		try { sdkQuery?.close(); } catch {}
+	};
+	const onAbort = () => {
+		wasAborted = true;
+		void sdkQuery?.interrupt().catch(() => {});
+		closeQuery();
+	};
+
+	try {
+		const { mcpTools, customToolNameToSdk, customToolNameToPi } = resolveMcpTools(context);
+		const history = context.messages;
+		const priorMessages = history.slice(0, turnStart(history));
+		const promptBlocks = extractUserPromptBlocks(history);
+		const promptText = extractUserPrompt(history)
+			|| (priorMessages.at(-1)?.role === "toolResult" ? CONTINUE_AFTER_TOOL_RESULTS_PROMPT : "");
+		if (!promptText && !promptBlocks) {
+			throw new Error("runOutOfBandStep: out-of-band step was called with neither a user prompt nor tool results to continue from");
+		}
+
+		const cliModel = claudeCodeModelId(model, longContextSettings);
+		let resume: string | undefined;
+		if (priorMessages.length > 0) {
+			const session = createSession({ projectPath: cwd, claudeDir, model: cliModel });
+			sessionId = session.sessionId;
+			convertAndImportMessages(session, priorMessages, customToolNameToSdk);
+			session.save();
+			// Every prior message can convert to nothing (an aborted turn, another
+			// provider's thinking alone), and an empty transcript is no session to resume.
+			if (session.records.length > 0) resume = session.sessionId;
+		}
+
+		// Streamed like the live path's prompt, so stdin stays open while CC calls the
+		// in-process MCP server; consumeQuery ends it on the result.
+		const promptStream = makePromptStream();
+		void promptStream.push(userMessage(promptBlocks ?? [{ type: "text", text: promptText }]))
+			.catch((error) => debug(`out-of-band step: prompt push rejected:`, error));
+		queryCtx.promptStream = promptStream;
+		// Handlers park until the finally below releases them, after the query is closed:
+		// the caller runs the tools, and their results arrive as the next step's history.
+		const mcpServers = buildMcpServers(mcpTools, queryCtx);
+		const claudeExecutable = loadConfig(cwd).provider?.pathToClaudeCodeExecutable;
+		const effort = effortForReasoning(model, options?.reasoning);
+		debug(`out-of-band step: spawn model=${cliModel} effort=${effort ?? "default"} msgs=${history.length} priors=${priorMessages.length} resume=${resume?.slice(0, 8) ?? "none"} tools=${mcpTools.length} prompt=${promptText.slice(0, 60)}${promptBlocks ? " [+images]" : ""}`);
+
+		sdkQuery = queryImpl({
+			prompt: promptStream.stream,
+			options: {
+				cwd,
+				env: { ...process.env, ...CC_CHILD_ENV },
+				settings: { autoMemoryEnabled: false },
+				tools: [],
+				strictMcpConfig: true,
+				settingSources: [] as SettingSource[],
+				skills: [],
+				persistSession: false,
+				maxTurns: OUT_OF_BAND_STEP_MAX_TURNS,
+				permissionMode: "bypassPermissions",
+				includePartialMessages: true,
+				systemPrompt: context.systemPrompt,
+				model: cliModel,
+				// Same reason as the live path: thinking text only streams when summarized.
+				...(effort ? { effort, extraArgs: { "thinking-display": "summarized" } } : {}),
+				...(mcpServers ? { mcpServers } : {}),
+				...(resume ? { resume } : {}),
+				...(claudeExecutable ? { pathToClaudeCodeExecutable: claudeExecutable } : {}),
+				...makeCliDebugOptions("out-of-band-step"),
+			},
+		});
+
+		if (options?.signal) {
+			if (options.signal.aborted) onAbort();
+			else options.signal.addEventListener("abort", onAbort, { once: true });
+		}
+
+		// The turn ends at the model's answer or at the message_stop of its tool calls,
+		// whose handlers would hold the query open forever. Closing then ends consumeQuery.
+		void stream.result().then(closeQuery);
+		await consumeQuery(sdkQuery, customToolNameToPi, model, () => wasAborted, queryCtx);
+
+		if (wasAborted || options?.signal?.aborted) {
+			if (queryCtx.currentPiStream && queryCtx.turnOutput) {
+				queryCtx.turnOutput.stopReason = "aborted";
+				queryCtx.turnOutput.errorMessage = "Operation aborted";
+				stream.push({ type: "error", reason: "aborted", error: queryCtx.turnOutput });
+				markStreamComplete(stream);
+				stream.end();
+				queryCtx.currentPiStream = null;
+			}
+			debug("out-of-band step: aborted");
+			return;
+		}
+		debug(`out-of-band step: done stopReason=${queryCtx.turnOutput?.stopReason} error=${queryCtx.turnOutput?.errorMessage ?? "none"}`);
+		finalizeCurrentStream(queryCtx, queryCtx.turnOutput?.stopReason);
+	} catch (err) {
+		debug("out-of-band step: threw; pushing terminal error", err);
+		if (queryCtx.currentPiStream && queryCtx.turnOutput) {
+			const aborted = wasAborted || Boolean(options?.signal?.aborted);
+			queryCtx.turnOutput.stopReason = aborted ? "aborted" : "error";
+			queryCtx.turnOutput.errorMessage ??= aborted ? "Operation aborted" : errorMessage(err);
+			stream.push({ type: "error", reason: aborted ? "aborted" : "error", error: queryCtx.turnOutput });
+			markStreamComplete(stream);
+			stream.end();
+			queryCtx.currentPiStream = null;
+		}
+	} finally {
+		options?.signal?.removeEventListener("abort", onAbort);
+		// Closed before the handlers are released: an answered handler in a live CLI
+		// would run the model on a result the caller never produced.
+		closeQuery();
+		queryCtx.promptStream?.fail(new Error("out-of-band step ended"));
+		queryCtx.promptStream = null;
+		queryCtx.releasePendingToolCalls("Out-of-band step ended");
+		if (sessionId) {
+			try {
+				deleteSession(sessionId, cwd, claudeDir);
+			} catch (error) {
+				debug(`out-of-band step: could not delete session ${sessionId.slice(0, 8)}:`, error);
+			}
+		}
 	}
 }
 
@@ -887,6 +1135,7 @@ export const __test = {
 	},
 	toBridgeContext,
 	isolatedStreamFn,
+	isOutOfBandCall,
 	effortForReasoning,
 	syncSharedSession,
 	extractUserPromptBlocks,
@@ -1776,6 +2025,19 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	if (options?.cacheRetention === "none") {
 		debug(`provider: one-off summarizer call (cacheRetention none) routed to isolated summary, msgs=${context.messages.length}`);
 		return isolatedStreamFn(model, context, options);
+	}
+
+	// An extension calling the model on its own, with or without tools, carries no
+	// session and a prompt of its own — routing it here
+	// answers it in an isolated CC process instead of failing the capture lookup and
+	// instead of dragging the shared session into a turn nobody asked for.
+	if (isOutOfBandCall(context, options)) {
+		if (isOneShotShape(context)) {
+			debug(`provider: out-of-band one-shot (no session, no tools, ${context.messages.length} user msgs, ${context.systemPrompt?.length ?? 0}-char prompt with no capture) routed to isolated run`);
+			return isolatedStreamFn(model, context, options, "one-shot");
+		}
+		debug(`provider: out-of-band step (no session, ${context.tools?.length ?? 0} tools, ${context.messages.length} msgs, ${context.systemPrompt?.length ?? 0}-char prompt with no capture) routed to isolated step`);
+		return outOfBandStepStreamFn(model, context, options);
 	}
 
 	const stream = createAssistantMessageEventStream();

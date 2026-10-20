@@ -34,6 +34,7 @@ import { buildActionSummary, type ToolCallState } from "./askclaude-ui.js";
 import { askClaudeCallTags, askClaudeToolDescription, buildAskClaudeParams, resolveAskClaudeDefaults, resolveAskClaudeMode, type AskClaudeMode } from "./askclaude-schema.js";
 import { nonSystemMessages, toBridgeContext } from "./transcript.js";
 import { forgetSessionCwd, rememberSessionCwd, rememberSummarySession, sessionCwdFor, summarySessionFor } from "./session-cwd.js";
+import { bindChildEnvSession, buildChildEnv, unbindChildEnvSession, type ChildEnvPurpose } from "./child-env.js";
 import { updateUsage, type SdkUsage } from "./usage.js";
 import { rateLimitResponse } from "./rate-limit.js";
 import { bridgeRevision, packageVersion, setTraceNotifier, traceAssertReady, traceEvent, traceId, traceInput, traceQueryStart, traceSignalId, traceSnapshot, traceStrict } from "./cache-trace.js";
@@ -104,6 +105,22 @@ function ccChildEnv(overrides: Record<string, string> = {}, parent: NodeJS.Proce
 		else env[name] = value;
 	}
 	return { ...env, ...CC_CHILD_ENV };
+}
+
+// The `env` for one Claude Code child: ccChildEnv's environment, adjusted by the
+// serving pi session's child-env listeners (see child-env.ts). Called once per query
+// construction, so a parked query's continuation keeps its spawn environment.
+function childEnvFor(
+	purpose: ChildEnvPurpose,
+	sessionId: string | null | undefined,
+	model: { id: string; provider?: string; contextWindow?: number },
+	overrides?: Record<string, string>,
+): Record<string, string> {
+	return buildChildEnv(ccChildEnv(overrides), CC_CHILD_ENV, {
+		purpose,
+		sessionId,
+		model: { id: model.id, provider: model.provider, contextWindow: model.contextWindow },
+	}, (message) => debug(`child-env(${purpose}): ${message}`));
 }
 
 // Pi owns context files on the provider path, so Claude Code must not load its
@@ -560,7 +577,8 @@ async function runIsolatedSummary(
 			? extractUserPrompt(context.messages)
 			: extractIsolatedSummaryPrompt(context.messages);
 		if (!promptText) throw new Error("runIsolatedSummary: one-off summary without a user prompt (last message is not user?)");
-		const cwd = sessionCwdFor(summarySessionFor(options?.signal) ?? options?.sessionId);
+		const summarySessionId = summarySessionFor(options?.signal) ?? options?.sessionId;
+		const cwd = sessionCwdFor(summarySessionId);
 		const compactProviderSettings = loadConfig(cwd).provider;
 		const claudeExecutable = compactProviderSettings?.pathToClaudeCodeExecutable;
 		const cliModel = claudeCodeModelId(model, longContextSettings);
@@ -572,7 +590,7 @@ async function runIsolatedSummary(
 			prompt: promptText,
 			options: {
 				cwd,
-				env: traceQueryStart(traceQueryId, { kind: "isolated-summary", callId: traceCallId, model: cliModel }, ccChildEnv(options?.env)),
+				env: traceQueryStart(traceQueryId, { kind: "isolated-summary", callId: traceCallId, model: cliModel }, childEnvFor("summary", summarySessionId, model, options?.env)),
 				settings: { autoMemoryEnabled: false },
 				tools: [],
 				strictMcpConfig: true,
@@ -875,6 +893,7 @@ export const __test = {
 	drainForAbort,
 	CC_CHILD_ENV,
 	ccChildEnv,
+	childEnvFor,
 	buildMcpServers,
 	get promptCaptures() {
 		return promptCaptures;
@@ -2147,7 +2166,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			kind: "provider", callId: traceCallId, piSessionId, reentrant: isReentrant, resume: resumeSessionId ?? null,
 			model: cliModel, effort: effort ?? null, servedToolNames: Object.fromEntries(customToolNameToSdk), mcpTools: mcpTools.map((t) => t.name),
 			signal: traceSignalId(options?.signal), digests: { systemPromptAppend },
-		}, ccChildEnv(options?.env));
+		}, childEnvFor("provider", piSessionId, model, options?.env));
 		const cliDebug = makeCliDebugOptions("provider");
 		const childProcess = new QueryProcess(cliDebug.stderr);
 		const queryOptions: NonNullable<Parameters<typeof query>[0]["options"]> = {
@@ -2458,7 +2477,7 @@ async function promptAndWait(
 		prompt,
 		options: {
 			cwd,
-			env: traceQueryStart(traceQueryId, { kind: "askclaude", piSessionId: askClaudeSessionId, resume: resumeSessionId, model: cliModel, mode, isolated: Boolean(options?.isolated) }, ccChildEnv()),
+			env: traceQueryStart(traceQueryId, { kind: "askclaude", piSessionId: askClaudeSessionId, resume: resumeSessionId, model: cliModel, mode, isolated: Boolean(options?.isolated) }, childEnvFor("askclaude", askClaudeSessionId, model ?? { id: modelId })),
 			permissionMode: "bypassPermissions",
 			settings: { ...claudeCodeSettings(providerSettings), claudeMdExcludes: CLAUDE_MD_EXCLUDES },
 			skills: [],
@@ -2632,10 +2651,24 @@ export default function (pi: ExtensionAPI) {
 			g[ACTIVE_STREAM_SIMPLE_KEY] = undefined;
 		}
 	};
+	// Child-env requests for this instance's session go to this instance's event bus,
+	// whichever module instance serves the query (see child-env.ts). The registry
+	// holds childEnvOwner weakly; this instance's handlers keep it, and with it the
+	// binding, alive exactly as long as the session's runtime is reachable.
+	const childEnvOwner = {};
+	let childEnvSessionId: string | undefined;
+	const unbindChildEnv = () => {
+		if (childEnvSessionId !== undefined) unbindChildEnvSession(childEnvSessionId, childEnvOwner);
+		childEnvSessionId = undefined;
+	};
 	pi.on("session_start", (event, ctx) => {
 		piUI = ctx.ui;
 		piMode = ctx.mode;
-		rememberSessionCwd(ctx.sessionManager.getSessionId(), ctx.cwd);
+		const sessionId = ctx.sessionManager.getSessionId();
+		rememberSessionCwd(sessionId, ctx.cwd);
+		if (childEnvSessionId !== sessionId) unbindChildEnv();
+		bindChildEnvSession(sessionId, pi.events, childEnvOwner);
+		childEnvSessionId = sessionId;
 		if (event.reason === "new" || event.reason === "resume" || event.reason === "fork") {
 			clearSession(`session_start:${event.reason}`);
 		}
@@ -2706,6 +2739,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_shutdown", (_event, ctx) => {
 		forgetSessionCwd(ctx.sessionManager.getSessionId());
 		closeSessionQueries(ctx.sessionManager.getSessionId());
+		unbindChildEnv();
 		clearSession("session_shutdown");
 	});
 

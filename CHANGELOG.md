@@ -15,6 +15,7 @@
 - **Fix: bash default timeout broke the prompt cache on rebuild (#203)** — The 120s default now applies when the command runs instead of being saved in pi's history, so rebuilt sessions match Claude Code's. Thanks @cad0p and @superninjv.
 - **Bump: Claude Agent SDK 0.3.308 (Claude Code 2.1.308)** — Claude Code's new per-request log in session files is turned off; it made them about a third larger.
 - **Debug: opt-in cache trace** — `CLAUDE_BRIDGE_TRACE_DIR` logs session decisions to help diagnose prompt-cache loss. See `diag/CACHE-TRACE.md`.
+- **Fix: forward token prices to bridged models** — Use pi-ai's Anthropic catalog rates, including cache read/write prices and pricing tiers, and retain one-hour cache-write usage for reference cost estimates on normal responses, not Claude Code subscription charges. Cache lifetime metadata remains withheld: Pi's replay-based cache warming is covered by an offline runtime contract test, but bridge refresh support has not been validated.
 
 ## 0.9.3 — 2026-10-13
 

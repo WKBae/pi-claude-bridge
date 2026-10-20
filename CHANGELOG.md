@@ -1,5 +1,9 @@
 # Changelog
 
+## UNRELEASED
+
+- **Fix: extension model calls outside a pi turn** — an extension that calls `modelRegistry.streamSimple` with its own system prompt failed with `prompt-capture: no capture for this N-char system prompt`, because no capture boundary had recorded that prompt. A call with no session id and a prompt no capture accounts for now runs in an isolated `persistSession:false` Claude Code process with no session sync, which keeps it out of the shared session and out of the reentrant-query logic while the main query waits on it. A call with no tools and only user messages runs as a one-shot: consecutive user messages (follow-up questions) are joined, attached images reach Claude Code as blocks, and the answer reports the usage it cost. A call with tools or earlier tool calls runs as one step of the extension's own tool loop: the history goes into a throwaway Claude Code session that is deleted afterwards, the extension's tools are served over MCP, and the step ends with the model's answer or hands every tool call of the turn back unanswered, so their results arrive as the next step's history. Session-addressed turns, recorded prompts and tool results a live query is parked on keep the live path. A prompt carrying pi's own harness is still refused rather than forwarded, so it keeps the loud diagnostic instead of a 400 or a charge to the user's extra usage. `PromptCaptures.canResolve` answers the routing question without touching the registry or the diagnostic log.
+
 ## 0.9.3 — 2026-10-13
 
 - **Remove: compaction and branch-summary takeovers (#189)** — pi runs them natively; the bridge routes summary calls to its isolated path. Other compaction extensions should now work. Resolves #115. Thanks @sonSunnoi.

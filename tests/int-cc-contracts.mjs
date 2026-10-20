@@ -330,6 +330,42 @@ test("a streamed prompt keeps the query open past result until the input generat
 		`the SDK closed stdin on its own ${exitAt - resultAt}ms after result — a streamed prompt no longer parks the query, so steering is dead`);
 });
 
+test("a one-message streamed prompt finishes on maxTurns 1 and carries image blocks", { timeout: 120_000 }, async () => {
+	// What the isolated one-shot path depends on (src/index.ts runIsolatedSummary): a
+	// single message from a generator that then ends, no further input, `maxTurns: 1`,
+	// must still end in a successful result — otherwise an extension's model call
+	// hangs instead of answering. Image blocks only travel in streamed input, so the
+	// same turn proves they arrive intact.
+	// 32x32 solid crimson PNG, the fixture tests/int-image-session.mjs validates.
+	const CRIMSON_PNG =
+		"iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAKklEQVR4nGO4I2JDU8QwasGoBaMWjFow" +
+		"asGoBaMWjFowasGoBaMWDBULADahsD1ndvqVAAAAAElFTkSuQmCC";
+
+	async function* oneMessage(content) {
+		yield { type: "user", message: { role: "user", content }, parent_tool_use_id: null };
+	}
+
+	const text = await collect(query({
+		prompt: oneMessage("Reply with just: OK"),
+		options: providerOptions({ persistSession: false, settingSources: [], maxTurns: 1, systemPrompt: "Answer in as few words as possible." }),
+	}));
+	assert.equal(text.result?.subtype, "success", `a one-message streamed prompt did not finish: ${JSON.stringify(text.result)}`);
+	assert.equal(text.result.is_error, false, `an empty one-message turn errored: ${JSON.stringify(text.result)}`);
+
+	const image = await collect(query({
+		prompt: oneMessage([
+			{ type: "text", text: "Reply with just the colour word of this image." },
+			{ type: "image", source: { type: "base64", media_type: "image/png", data: CRIMSON_PNG } },
+		]),
+		options: providerOptions({ persistSession: false, settingSources: [], maxTurns: 1, systemPrompt: "Answer in as few words as possible." }),
+	}));
+	assert.equal(image.result?.subtype, "success", `an image turn did not finish: ${JSON.stringify(image.result)}`);
+	// A rejected block comes back as an API error the SDK retries without the image,
+	// so is_error stays false; the answer is what tells the two apart.
+	assert.match(String(image.result.result), /crimson|red/i,
+		`CC did not answer from the image block: ${String(image.result.result).slice(0, 200)}`);
+});
+
 // --- The in-process MCP server ---
 
 test("the SDK treats our McpServer as an opaque endpoint — it only calls connect", { timeout: 120_000 }, async () => {
@@ -437,6 +473,71 @@ test("arbitrary sanitized tool_use ids in an imported transcript resume fine", {
 		if (message.type === "assistant") for (const block of message.message?.content ?? []) if (block.type === "text") answer += block.text;
 	}
 	assert.match(answer, /platypus/i, `CC did not resume a transcript with non-toolu_ ids: ${answer}`);
+});
+
+test("resume with persistSession false reads an imported transcript and leaves it unwritten", { timeout: 120_000 }, async () => {
+	// The out-of-band tool step (src/index.ts runOutOfBandStep) imports a caller's
+	// history into a throwaway session and resumes it with persistSession: false.
+	// That only works if the flag stops CC writing the file, not reading it.
+	const sessionId = randomUUID();
+	const session = createSession({ sessionId, projectPath: CWD, claudeDir: process.env.CLAUDE_CONFIG_DIR, model: MODEL });
+	session.importMessages(repairToolPairing([
+		{ role: "user", content: "Look up the vault code." },
+		{ role: "assistant", content: [{ type: "tool_use", id: "pi_vault_1", name: "mcp__custom-tools__vault", input: {} }] },
+		{ role: "user", content: [{ type: "tool_result", tool_use_id: "pi_vault_1", content: "The vault code is PLATYPUS." }] },
+	]));
+	session.save();
+	const before = readFileSync(session.jsonlPath, "utf8");
+	try {
+		const { result } = await collect(query({
+			prompt: "Continue from the tool result above: reply with just the vault code.",
+			options: providerOptions({ resume: sessionId, persistSession: false, settingSources: [], systemPrompt: "Answer in as few words as possible." }),
+		}));
+		assert.equal(result?.subtype, "success", `resumed step did not finish: ${JSON.stringify(result)}`);
+		assert.match(String(result.result), /platypus/i, `persistSession: false resume did not read the imported transcript: ${result.result}`);
+		assert.equal(readFileSync(session.jsonlPath, "utf8"), before, "persistSession: false still appended to the resumed transcript");
+	} finally {
+		rmSync(session.jsonlPath, { force: true });
+	}
+});
+
+test("a tool_use streams through message_stop before its tools/call blocks, and close() ends the query", { timeout: 120_000 }, async () => {
+	// The out-of-band tool step hands the model's tool calls to its caller and closes
+	// the query instead of answering them. That needs the whole assistant message,
+	// every parallel tool_use included, to arrive while the MCP handler is still
+	// pending, and close() to end iteration rather than hang on that handler.
+	const server = new McpServer({ name: "custom-tools", version: "1.0.0" }, { capabilities: { tools: {} } });
+	server.server.setRequestHandler(ListToolsRequestSchema, () => ({ tools: [noArgTool("alpha"), noArgTool("beta")] }));
+	server.server.setRequestHandler(CallToolRequestSchema, () => new Promise(() => {}));
+	const q = query({
+		prompt: "Call both the alpha tool and the beta tool at the same time, in a single assistant message with two parallel tool calls.",
+		options: providerOptions({
+			persistSession: false, includePartialMessages: true,
+			mcpServers: { "custom-tools": { type: "sdk", name: "custom-tools", instance: server } },
+		}),
+	});
+	const streamed = [];
+	let stopped = false;
+	const done = (async () => {
+		for await (const message of q) {
+			const event = message.type === "stream_event" ? message.event : null;
+			if (event?.type === "content_block_start" && event.content_block?.type === "tool_use") streamed.push(event.content_block.name);
+			if (event?.type === "message_stop" && streamed.length > 0) {
+				stopped = true;
+				q.close();
+			}
+		}
+	})();
+	let timer;
+	const outcome = await Promise.race([
+		done.then(() => "ended", (error) => `threw: ${error?.message ?? error}`),
+		new Promise((resolve) => { timer = setTimeout(() => resolve("hung"), 60_000); }),
+	]);
+	clearTimeout(timer);
+	assert.ok(stopped, `no tool_use message reached message_stop: ${JSON.stringify(streamed)}`);
+	assert.equal(outcome, "ended", `close() with a pending tools/call did not end iteration cleanly: ${outcome}`);
+	assert.deepEqual([...streamed].sort(), ["mcp__custom-tools__alpha", "mcp__custom-tools__beta"],
+		`the parallel tool calls did not stream within one message: ${JSON.stringify(streamed)}`);
 });
 
 test("CC writes each tool result of a parallel turn as its own transcript record", { timeout: 120_000 }, async () => {

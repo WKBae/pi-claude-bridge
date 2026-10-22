@@ -4,7 +4,7 @@ import { buildSessionContext, keyHint, type ExtensionAPI, type ExtensionContext,
 import { query, type EffortLevel, type SDKMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
 import type { Base64ImageSource, ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { Text } from "@earendil-works/pi-tui";
-import { createSession, deleteSession, openSession, repairToolPairing } from "cc-session-io";
+import { createSession, deleteSession, openSession, repairToolPairing, type AssistantRecord } from "cc-session-io";
 import { appendFileSync, mkdirSync, realpathSync, statSync } from "fs";
 import { dirname, join } from "path";
 import { PROVIDER_ID, messageContentToText, convertPiMessages } from "./convert.js";
@@ -28,7 +28,7 @@ import { buildActionSummary, type ToolCallState } from "./askclaude-ui.js";
 import { askClaudeCallTags, askClaudeToolDescription, buildAskClaudeParams, resolveAskClaudeDefaults, resolveAskClaudeMode, type AskClaudeMode } from "./askclaude-schema.js";
 import { nonSystemMessages, toBridgeContext } from "./transcript.js";
 import { forgetSessionCwd, rememberSessionCwd, rememberSummarySession, sessionCwdFor, summarySessionFor } from "./session-cwd.js";
-import { updateUsage, type SdkUsage } from "./usage.js";
+import { lastContextUsage, updateUsage, type SdkUsage } from "./usage.js";
 import { rateLimitResponse } from "./rate-limit.js";
 
 // --- Debug logging ---
@@ -380,6 +380,24 @@ function convertAndImportMessages(
 	}
 	if (repaired.length) {
 		session.importMessages(repaired, placed?.attachments.length ? { attachments: placed.attachments } : undefined);
+	}
+}
+
+// Imported assistant records carry zero usage, which Claude Code skips when it sizes a
+// resumed session (see lastContextUsage). Stamp pi's measurement on the record imported
+// from the measured message, so Claude Code anchors there and estimates only the records
+// after it from their bytes. convertPiMessages drops only assistant turns with no content
+// and repairToolPairing keeps every assistant, so each remaining one is exactly one record.
+function stampContextUsage(session: ReturnType<typeof createSession>, messages: Context["messages"]): void {
+	const measured = lastContextUsage(messages);
+	if (!measured) return;
+	let later = messages.slice(measured.index + 1).filter((m) => m.role === "assistant" && m.content.length > 0).length;
+	const records = session.records;
+	for (let i = records.length - 1; i >= 0; i--) {
+		if (records[i].type !== "assistant" || later-- > 0) continue;
+		(records[i] as AssistantRecord).message.usage = measured.usage;
+		debug(`stampContextUsage: record ${i} of ${records.length} ←`, JSON.stringify(measured.usage));
+		return;
 	}
 }
 
@@ -834,6 +852,7 @@ function debugSessionPaths(label: string, cwd: string, jsonlPath: string): void 
 		...(modelId ? { model: modelId } : {}),
 	});
 	convertAndImportMessages(session, priorMessages, customToolNameToSdk, carried);
+	stampContextUsage(session, priorMessages);
 	session.save();
 	// records, not messages: `messages` filters out the attachment records that
 	// carrying an `@file` expansion across a rebuild writes into the same file.

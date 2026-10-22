@@ -1,5 +1,9 @@
 # Changelog
 
+## UNRELEASED
+
+- **Fix: "Prompt is too long" after a session rebuild** — a rebuilt Claude Code transcript carried zero usage on every record, so Claude Code sized the whole history from its bytes and refused a long session locally, before any request reached the API or a compressing proxy. That also broke pi's overflow recovery, whose summary call failed the same way. The rebuild now writes pi's last measured context usage on the final assistant record.
+
 ## 0.9.3 — 2026-10-13
 
 - **Remove: compaction and branch-summary takeovers (#189)** — pi runs them natively; the bridge routes summary calls to its isolated path. Other compaction extensions should now work. Resolves #115. Thanks @sonSunnoi.

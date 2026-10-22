@@ -25,7 +25,7 @@ type InheritedPrompt = {
 
 export type PromptCapture = PromptCaptureInput & {
 	assembledPrompt: string;
-	/** Which bridge boundary last recorded this key (before_agent_start | agent_start | turn_start). */
+	/** Which bridge boundary last recorded this key (before_agent_start | agent_start | turn_start | agent_settled). */
 	source?: string;
 	/** Exact previously assembled prompts embedded in `custom`. */
 	inherited: InheritedPrompt[];

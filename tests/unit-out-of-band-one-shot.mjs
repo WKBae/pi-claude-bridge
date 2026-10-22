@@ -3,8 +3,8 @@
  * so projection has nothing to forward and the live path used to fail the call with
  * "prompt-capture: no capture". A call may ask one question or be one step of the
  * extension's own tool loop. Both now run in an isolated
- * CC process, and only when the call cannot be a pi turn: no session id, a prompt no
- * capture accounts for, and no tool result a live query is parked on.
+ * CC process, and only when the call cannot be a pi turn: no session id the bridge's hooks
+ * reported, a prompt no capture accounts for, and no tool result a live query is parked on.
  *
  * The live path must keep every other shape, so each guard is asserted from the side
  * that must NOT take the isolated route.
@@ -29,13 +29,17 @@ const { QueryContext } = await import("../src/query-state.js");
 const { openSession } = await import("cc-session-io");
 
 let providerConfig;
+const handlers = {};
 activate({
-	on: () => {},
+	on: (name, fn) => { (handlers[name] ??= []).push(fn); },
 	registerProvider: (_name, config) => { providerConfig = config; },
 	registerTool: () => {},
 });
 const model = providerConfig.models[0];
 const streamSimple = providerConfig.streamSimple;
+const fire = (name, sessionId) => {
+	for (const fn of handlers[name]) fn({}, { sessionManager: { getSessionId: () => sessionId }, getSystemPrompt: () => undefined });
+};
 
 // An extension's own prompt for a single question: the point is a prompt no capture
 // recorded, and a recognisable one makes a regression obvious in the failure text.
@@ -218,11 +222,20 @@ describe("shapes that must stay on the live path", () => {
 		assert.equal(__test.activeQueryContexts.size, 0);
 	};
 
-	it("keeps a session-addressed turn on the live path", async () => {
+	it("keeps a turn of a session the bridge has seen on the live path", async () => {
+		fire("turn_start", "pi-session");
 		await assertLivePathRefused(
 			{ systemPrompt: ONE_SHOT_SYSTEM, messages: [user("hi")] },
 			{ sessionId: "pi-session" },
 		);
+	});
+
+	it("keeps a session seen at turn_start live until session_shutdown", () => {
+		const context = { systemPrompt: ONE_SHOT_SYSTEM, messages: [user("hi")] };
+		fire("turn_start", "seen-then-closed");
+		assert.equal(__test.isOutOfBandCall(context, { sessionId: "seen-then-closed" }), false);
+		fire("session_shutdown", "seen-then-closed");
+		assert.equal(__test.isOutOfBandCall(context, { sessionId: "seen-then-closed" }), true, "a closed session's id is no longer a pi conversation");
 	});
 
 	it("keeps a tool result a live query is parked on with that query", () => {
@@ -289,6 +302,7 @@ describe("shapes that must stay on the live path", () => {
 			messages: [user("hi")],
 		};
 		assert.equal(__test.isOutOfBandCall(context, undefined), false, "pi's harness keeps the live refusal");
+		assert.equal(__test.isOutOfBandCall(context, { sessionId: "f3b1c2d4-routing-id" }), false, "so does an unseen routing id");
 
 		const result = await call(context, {}).result();
 		assert.equal(result.stopReason, "error");
@@ -303,6 +317,17 @@ describe("shapes that must stay on the live path", () => {
 		};
 		assert.equal(__test.isOutOfBandCall(context, undefined), false);
 		assert.equal(calls.length, 0);
+	});
+
+	it("runs a call carrying a routing id no hook reported, as pi-btw sends", async () => {
+		const result = await call(
+			{ systemPrompt: ONE_SHOT_SYSTEM, messages: [user("Side question.")] },
+			{ sessionId: "5d0c9a7e-2f1b-4c3a-9e8d-routing" },
+		).result();
+
+		assert.equal(result.stopReason, "stop", result.errorMessage);
+		assert.equal(calls.length, 1);
+		assert.equal(calls[0].options.persistSession, false, "no CC session is written");
 	});
 
 	it("reports the usage its answer cost instead of zero", async () => {

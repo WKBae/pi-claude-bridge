@@ -88,7 +88,7 @@ describe("turn_start prompt capture", () => {
 		// A later in-run turn renders a new prompt (mid-run tool-loadout change,
 		// section re-render). turn_start re-keys it.
 		const turnTwo = `${WIDENED}\n# Tools\n- git_status: Report repo state\n`;
-		handlers.get("turn_start")({}, { getSystemPrompt: () => turnTwo });
+		handlers.get("turn_start")({}, { sessionManager: { getSessionId: () => "pi-session" }, getSystemPrompt: () => turnTwo });
 
 		const capture = __test.promptCaptures.resolve(turnTwo);
 		assert.ok(capture, "the rebuilt prompt must resolve after turn_start");
@@ -102,8 +102,8 @@ describe("turn_start prompt capture", () => {
 		handlers.get("agent_start")({}, { getSystemPrompt: () => WIDENED });
 
 		const before = __test.promptCaptures.size;
-		handlers.get("turn_start")({}, { getSystemPrompt: () => WIDENED });
-		handlers.get("turn_start")({}, { getSystemPrompt: () => WIDENED });
+		handlers.get("turn_start")({}, { sessionManager: { getSessionId: () => "pi-session" }, getSystemPrompt: () => WIDENED });
+		handlers.get("turn_start")({}, { sessionManager: { getSessionId: () => "pi-session" }, getSystemPrompt: () => WIDENED });
 
 		assert.ok(__test.promptCaptures.resolve(WIDENED), "the prompt still resolves");
 		assert.equal(__test.promptCaptures.size, before, "re-firing an unchanged prompt must not grow the registry");

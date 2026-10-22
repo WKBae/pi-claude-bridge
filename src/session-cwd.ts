@@ -36,3 +36,25 @@ export function forgetSessionCwd(sessionId: string): void {
 export function sessionCwdFor(sessionId: string | null | undefined): string {
 	return (sessionId ? store().get(sessionId) : undefined) ?? process.cwd();
 }
+
+// Pi session ids some instance's hooks have reported. Extensions pass their own routing
+// ids as `sessionId` too, so only an id reported here marks a call as part of a pi
+// conversation. Shared on globalThis for the same reason as the cwd map.
+const SEEN_SESSIONS_KEY = Symbol.for("claude-bridge:seenSessions");
+
+function seenSessions(): Set<string> {
+	const g = globalThis as Record<symbol, unknown>;
+	return (g[SEEN_SESSIONS_KEY] ??= new Set<string>()) as Set<string>;
+}
+
+export function rememberSession(sessionId: string): void {
+	seenSessions().add(sessionId);
+}
+
+export function forgetSession(sessionId: string): void {
+	seenSessions().delete(sessionId);
+}
+
+export function isSeenSession(sessionId: string): boolean {
+	return seenSessions().has(sessionId);
+}

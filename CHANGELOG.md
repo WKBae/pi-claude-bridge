@@ -1,5 +1,9 @@
 # Changelog
 
+## UNRELEASED
+
+- **Fix: /btw side questions asked while pi is idle** — pi-btw's side session embeds the system prompt pi renders between runs, which lacks the sections extensions add per run (`<acp_delegate>`, `<advisor_invocation_settings>`), so it matched no capture and failed with "prompt-capture: no capture …". The bridge now records that prompt when a run settles.
+
 ## 0.9.3 — 2026-10-13
 
 - **Remove: compaction and branch-summary takeovers (#189)** — pi runs them natively; the bridge routes summary calls to its isolated path. Other compaction extensions should now work. Resolves #115. Thanks @sonSunnoi.

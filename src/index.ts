@@ -10,7 +10,7 @@ import { dirname, join } from "path";
 import { PROVIDER_ID, messageContentToText, convertPiMessages } from "./convert.js";
 import { debugLogPath, diagLogPath } from "./log-paths.js";
 import { applyLongContext, buildModels, claudeCodeModelId, type LongContextSettings, resolveModel as _resolveModel } from "./models.js";
-import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, renderSkillsBlock } from "./skills.js";
+import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, renderSkillsBlock, skillsListedIn } from "./skills.js";
 import { verifyWrittenSession as _verifyWrittenSession } from "./session-verify.js";
 import { extractAllToolResults as _extractAllToolResults, type McpResult } from "./extract-tool-results.js";
 import { QueryContext, ctx } from "./query-state.js";
@@ -2529,6 +2529,26 @@ export default function (pi: ExtensionAPI) {
 	// next before_agent_start — accepted: a stale skills list beats failing the turn.
 	pi.on("turn_start", (_event, ctx) => {
 		recordSystemPrompt("turn_start", ctx.getSystemPrompt(), lastSystemPromptOptions);
+	});
+	// Between runs pi renders the prompt from its base options; the per-run copy that
+	// before_agent_start handlers added sections to is dropped before agent_settled.
+	// A side session opened while idle (pi-btw) embeds that prompt verbatim, so key it
+	// too. Base options never carry custom sections, so the stash's are left out. Their
+	// tools and skills are out of reach: a handler that edits one run's selectedTools or
+	// skills leaves the base ones behind both the stash and the active tools, so the idle
+	// prompt itself says which stashed skills pi listed. With no stash there are no
+	// context files or skills to attach, and a capture without them would silently drop
+	// the user's instructions, so nothing is recorded.
+	pi.on("agent_settled", (_event, ctx) => {
+		if (!lastSystemPromptOptions) return;
+		const systemPrompt = ctx.getSystemPrompt();
+		if (!systemPrompt) return;
+		recordSystemPrompt("agent_settled", systemPrompt, {
+			...lastSystemPromptOptions,
+			sections: undefined,
+			selectedTools: undefined,
+			skills: skillsListedIn(systemPrompt, lastSystemPromptOptions.skills ?? []),
+		});
 	});
 	pi.on("session_shutdown", (_event, ctx) => {
 		forgetSessionCwd(ctx.sessionManager.getSessionId());

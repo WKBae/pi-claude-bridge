@@ -1,5 +1,9 @@
 # Changelog
 
+## UNRELEASED
+
+- **Add: show the API's reason for a cache miss** — when Claude Code requests Anthropic's cache diagnosis, the bridge keeps `cache_miss_reason` on the assistant message and, with `showCacheMissNotices` on, shows it below pi's cache miss notice (for example `Cache miss reason: model changed (22,330 tokens)`).
+
 ## 0.9.3 — 2026-10-13
 
 - **Remove: compaction and branch-summary takeovers (#189)** — pi runs them natively; the bridge routes summary calls to its isolated path. Other compaction extensions should now work. Resolves #115. Thanks @sonSunnoi.

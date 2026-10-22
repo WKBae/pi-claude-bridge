@@ -29,6 +29,7 @@ import { askClaudeCallTags, askClaudeToolDescription, buildAskClaudeParams, reso
 import { nonSystemMessages, toBridgeContext } from "./transcript.js";
 import { forgetSessionCwd, rememberSessionCwd, rememberSummarySession, sessionCwdFor, summarySessionFor } from "./session-cwd.js";
 import { updateUsage, type SdkUsage } from "./usage.js";
+import { CACHE_MISS_ENTRY, formatCacheMissReason, noticeableCacheMiss, recordCacheMissReason, type CacheMissReason } from "./cache-diagnosis.js";
 import { rateLimitResponse } from "./rate-limit.js";
 
 // --- Debug logging ---
@@ -1225,6 +1226,7 @@ function processStreamEvent(
 		c.turnStreamOpen = true;
 		c.turnStreamBlockStart = c.turnBlocks.length;
 		if (event.message?.usage) recordUsage(c.turnOutput, event.message.usage, model);
+		recordCacheMissReason(c.turnOutput, event.message);
 		return;
 	}
 
@@ -1460,6 +1462,7 @@ function processAssistantMessage(message: SDKMessage, model: Model<any>, customT
 		}
 	}
 	if (assistantMsg.usage && c.turnOutput) recordUsage(c.turnOutput, assistantMsg.usage, model);
+	if (c.turnOutput) recordCacheMissReason(c.turnOutput, assistantMsg);
 
 	// End the stream on tool_use, same as processStreamEvent's message_stop handler.
 	if (c.turnSawToolCall && c.currentPiStream && c.turnOutput) {
@@ -2558,6 +2561,26 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_compact", (event, ctx) =>
 		sponsorMarkRebuildForSession(ctx.sessionManager.getSessionId(), `session_compact:${event.reason}:willRetry=${event.willRetry}`));
 	pi.on("session_tree", (_event, ctx) => sponsorMarkRebuildForSession(ctx.sessionManager.getSessionId(), "session_tree"));
+
+	// The API's reason for a cache miss, shown under pi's own notice. message_end reaches
+	// extensions before pi persists the message, so the entry waits for the next event
+	// after persistence: the first tool execution, or turn_end when there is none.
+	let cacheMissToShow: CacheMissReason | undefined;
+	pi.on("message_end", (event) => {
+		if (event.message.role === "assistant") cacheMissToShow = noticeableCacheMiss(event.message);
+	});
+	const showCacheMiss = () => {
+		if (!cacheMissToShow) return;
+		pi.appendEntry<CacheMissReason>(CACHE_MISS_ENTRY, cacheMissToShow);
+		cacheMissToShow = undefined;
+	};
+	pi.on("tool_execution_start", showCacheMiss);
+	pi.on("turn_end", showCacheMiss);
+	// Follows pi's showCacheMissNotices; pi before getSettings() cannot tell, so it stays hidden.
+	pi.registerEntryRenderer<CacheMissReason>(CACHE_MISS_ENTRY, (entry, _options, theme) =>
+		entry.data && pi.getSettings?.().showCacheMissNotices === true
+			? new Text(theme.fg("warning", formatCacheMissReason(entry.data)), 1, 0)
+			: undefined);
 
 	// --- Provider ---
 	//

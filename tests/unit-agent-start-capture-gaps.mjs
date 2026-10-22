@@ -134,7 +134,7 @@ describe("agent_start capture — documented gaps", () => {
 		const handlers = activateWithMockPi();
 		handlers.get("before_agent_start")({ systemPrompt: "turn-1 prompt", systemPromptOptions: {} });
 		handlers.get("agent_start")({}, { getSystemPrompt: () => "turn-1 prompt" });
-		handlers.get("turn_start")({}, { getSystemPrompt: () => "turn-2 rendered prompt" });
+		handlers.get("turn_start")({}, { sessionManager: { getSessionId: () => "pi-session" }, getSystemPrompt: () => "turn-2 rendered prompt" });
 		assert.ok(__test.promptCaptures.resolveOrDerive("turn-2 rendered prompt"), "the turn_start record resolves");
 
 		// A rewrite landing after turn_start — a context-event handler replacing the

@@ -28,7 +28,7 @@ import { createToolServer } from "./mcp-server.js";
 import { buildActionSummary, type ToolCallState } from "./askclaude-ui.js";
 import { askClaudeCallTags, askClaudeToolDescription, buildAskClaudeParams, resolveAskClaudeDefaults, resolveAskClaudeMode, type AskClaudeMode } from "./askclaude-schema.js";
 import { nonSystemMessages, toBridgeContext } from "./transcript.js";
-import { forgetSessionCwd, rememberSessionCwd, rememberSummarySession, sessionCwdFor, summarySessionFor } from "./session-cwd.js";
+import { forgetSession, forgetSessionCwd, isSeenSession, rememberSession, rememberSessionCwd, rememberSummarySession, sessionCwdFor, summarySessionFor } from "./session-cwd.js";
 import { bindChildEnvSession, buildChildEnv, unbindChildEnvSession, type ChildEnvPurpose } from "./child-env.js";
 import { lastContextUsage, updateUsage, type SdkUsage } from "./usage.js";
 import { CACHE_MISS_ENTRY, formatCacheMissReason, noticeableCacheMiss, recordCacheMissReason, type CacheMissReason } from "./cache-diagnosis.js";
@@ -586,8 +586,9 @@ type IsolatedRunMode = "summary" | "one-shot";
  *  "prompt-capture: no capture".
  *
  *  Each condition is what keeps a real turn off this route rather than a guess about the
- *  caller. The provider's `streamSimple` receives the session pi opened for the turn, so a
- *  call without one is not part of a pi conversation; an unresolvable prompt is exactly
+ *  caller. Pi passes the turn's session to `streamSimple`, but extensions pass routing ids
+ *  of their own there too, so a session id counts as a pi conversation only once the
+ *  bridge's hooks reported it (`session_start`, `turn_start`); an unresolvable prompt is exactly
  *  the case the live path cannot serve; and a tool result some live query is parked on
  *  belongs to that query, whatever prompt arrives with it.
  *
@@ -596,7 +597,7 @@ type IsolatedRunMode = "summary" | "one-shot";
  *  this route must not become the way that text gets out. It stays on the live path,
  *  which fails it loudly with the diagnostic instead of a 400 or an extra-usage bill. */
 function isOutOfBandCall(context: Context, options: SimpleStreamOptions | undefined): boolean {
-	if (options?.sessionId) return false;
+	if (options?.sessionId && isSeenSession(options.sessionId)) return false;
 	if (!context.systemPrompt) return false;
 	if (context.messages.length === 0) return false;
 	if (unsendableFindings(context.systemPrompt, "this prompt").length > 0) return false;
@@ -2065,15 +2066,15 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	}
 
 	// An extension calling the model on its own, with or without tools, carries no
-	// session and a prompt of its own — routing it here
+	// session the bridge has seen and a prompt of its own — routing it here
 	// answers it in an isolated CC process instead of failing the capture lookup and
 	// instead of dragging the shared session into a turn nobody asked for.
 	if (isOutOfBandCall(context, options)) {
 		if (isOneShotShape(context)) {
-			debug(`provider: out-of-band one-shot (no session, no tools, ${context.messages.length} user msgs, ${context.systemPrompt?.length ?? 0}-char prompt with no capture) routed to isolated run`);
+			debug(`provider: out-of-band one-shot (unseen session, no tools, ${context.messages.length} user msgs, ${context.systemPrompt?.length ?? 0}-char prompt with no capture) routed to isolated run`);
 			return isolatedStreamFn(model, context, options, "one-shot");
 		}
-		debug(`provider: out-of-band step (no session, ${context.tools?.length ?? 0} tools, ${context.messages.length} msgs, ${context.systemPrompt?.length ?? 0}-char prompt with no capture) routed to isolated step`);
+		debug(`provider: out-of-band step (unseen session, ${context.tools?.length ?? 0} tools, ${context.messages.length} msgs, ${context.systemPrompt?.length ?? 0}-char prompt with no capture) routed to isolated step`);
 		return outOfBandStepStreamFn(model, context, options);
 	}
 
@@ -2773,6 +2774,7 @@ export default function (pi: ExtensionAPI) {
 		piMode = ctx.mode;
 		const sessionId = ctx.sessionManager.getSessionId();
 		rememberSessionCwd(sessionId, ctx.cwd);
+		rememberSession(sessionId);
 		if (childEnvSessionId !== sessionId) unbindChildEnv();
 		bindChildEnvSession(sessionId, pi.events, childEnvOwner);
 		childEnvSessionId = sessionId;
@@ -2840,11 +2842,17 @@ export default function (pi: ExtensionAPI) {
 	// the prompt can change at keeps exact-match alive mid-run. The stashed options can
 	// lag a mid-run tool-loadout change, which skews the hasRead skills filter until the
 	// next before_agent_start — accepted: a stale skills list beats failing the turn.
+	//
+	// Pi awaits turn_start before every provider call of a turn, while session_start
+	// fires only when extensions are bound, so turn_start is where every session the
+	// provider serves is guaranteed to be marked as seen.
 	pi.on("turn_start", (_event, ctx) => {
+		rememberSession(ctx.sessionManager.getSessionId());
 		recordSystemPrompt("turn_start", ctx.getSystemPrompt(), lastSystemPromptOptions);
 	});
 	pi.on("session_shutdown", (_event, ctx) => {
 		forgetSessionCwd(ctx.sessionManager.getSessionId());
+		forgetSession(ctx.sessionManager.getSessionId());
 		unbindChildEnv();
 		reportLeaks("session_shutdown");
 		clearSession("session_shutdown");

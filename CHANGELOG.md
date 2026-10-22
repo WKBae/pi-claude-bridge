@@ -15,6 +15,7 @@
 - **Fix: bash default timeout broke the prompt cache on rebuild (#203)** — The 120s default now applies when the command runs instead of being saved in pi's history, so rebuilt sessions match Claude Code's. Thanks @cad0p and @superninjv.
 - **Bump: Claude Agent SDK 0.3.308 (Claude Code 2.1.308)** — Claude Code's new per-request log in session files is turned off; it made them about a third larger.
 - **Debug: opt-in cache trace** — `CLAUDE_BRIDGE_TRACE_DIR` logs session decisions to help diagnose prompt-cache loss. See `diag/CACHE-TRACE.md`.
+- **Add: show the API's reason for a cache miss** — when Claude Code requests Anthropic's cache diagnosis, the bridge keeps `cache_miss_reason` on the assistant message and, with `showCacheMissNotices` on, shows it below pi's cache miss notice (for example `Cache miss reason: model changed (22,330 tokens)`).
 
 ## 0.9.3 — 2026-10-13
 

@@ -160,4 +160,61 @@ describe("syncSharedSession", () => {
 			rmSync(cwd, { recursive: true, force: true });
 		}
 	});
+
+	// Imported records carry zero usage, which Claude Code skips when it sizes a resumed
+	// session, so it estimated the whole transcript from its bytes and refused a long one
+	// as "Prompt is too long" without sending it. The rebuild hands it pi's measurement.
+	it("stamps pi's last measured usage on the last assistant record of a rebuild", () => {
+		const cwd = mkdtempSync(join(tmpdir(), "sync-shared-session-"));
+		const usage = (input, cacheRead) => ({ input, output: 50, cacheRead, cacheWrite: 10, totalTokens: input + 50 + cacheRead + 10 });
+		try {
+			const result = __test.syncSharedSession([
+				{ role: "user", content: "One", timestamp: Date.now() },
+				{ role: "assistant", content: [{ type: "text", text: "First." }], usage: usage(5, 1000), stopReason: "stop", timestamp: Date.now() },
+				{ role: "user", content: "Two", timestamp: Date.now() },
+				{ role: "assistant", content: [{ type: "text", text: "Second." }], usage: usage(7, 2000), stopReason: "stop", timestamp: Date.now() },
+				{ role: "user", content: "Three", timestamp: Date.now() },
+			], cwd);
+
+			const assistants = openSession({ sessionId: result.sessionId, projectPath: cwd }).messages
+				.filter((m) => m.type === "assistant")
+				.map((m) => m.message.usage);
+			assert.deepEqual(assistants, [
+				{ input_tokens: 0, output_tokens: 0 },
+				{ input_tokens: 7, output_tokens: 50, cache_read_input_tokens: 2000, cache_creation_input_tokens: 10 },
+			]);
+			deleteSession(result.sessionId, cwd);
+		} finally {
+			rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	// An errored turn keeps its partial content but has no usage. The measurement belongs on
+	// the turn that took it, or Claude Code would count the messages after it as measured too.
+	it("stamps the measured turn when an unmeasured turn follows it", () => {
+		const cwd = mkdtempSync(join(tmpdir(), "sync-shared-session-"));
+		const usage = { input: 7, output: 50, cacheRead: 2000, cacheWrite: 10, totalTokens: 2067 };
+		const none = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 };
+		try {
+			const result = __test.syncSharedSession([
+				{ role: "user", content: "One", timestamp: Date.now() },
+				{ role: "assistant", content: [{ type: "text", text: "First." }], usage, stopReason: "stop", timestamp: Date.now() },
+				{ role: "user", content: "x".repeat(50_000), timestamp: Date.now() },
+				{ role: "assistant", content: [{ type: "text", text: "Partial" }], usage: none, stopReason: "error", timestamp: Date.now() },
+				{ role: "assistant", content: [], usage: none, stopReason: "aborted", timestamp: Date.now() },
+				{ role: "user", content: "Again", timestamp: Date.now() },
+			], cwd);
+
+			const assistants = openSession({ sessionId: result.sessionId, projectPath: cwd }).messages
+				.filter((m) => m.type === "assistant")
+				.map((m) => m.message.usage);
+			assert.deepEqual(assistants, [
+				{ input_tokens: 7, output_tokens: 50, cache_read_input_tokens: 2000, cache_creation_input_tokens: 10 },
+				{ input_tokens: 0, output_tokens: 0 },
+			]);
+			deleteSession(result.sessionId, cwd);
+		} finally {
+			rmSync(cwd, { recursive: true, force: true });
+		}
+	});
 });

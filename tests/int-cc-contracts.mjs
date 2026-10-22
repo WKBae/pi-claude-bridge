@@ -36,7 +36,7 @@ import { join } from "node:path";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { createSession, openSession, repairToolPairing } from "cc-session-io";
+import { createSession, deleteSession, openSession, repairToolPairing } from "cc-session-io";
 
 const CWD = process.cwd();
 const MODEL = "claude-haiku-4-5";
@@ -666,6 +666,57 @@ function stubApi(requests) {
 /** cache_control markers are breakpoint directives, not cache-keyed content — CC 2.1.280
  *  moves them (and a 1h ttl) between turns, so payload comparisons strip them. */
 const sansCacheControl = (m) => JSON.parse(JSON.stringify(m, (_k, v) => (v === null || v === undefined) ? v : (typeof v === "object" && !Array.isArray(v) ? Object.fromEntries(Object.entries(v).filter(([key]) => key !== "cache_control")) : v)));
+
+// --- Context sizing of a resumed transcript ---
+
+// CC sizes a resumed session from the usage on its last assistant record with a nonzero
+// total and estimates the rest from bytes; at the blocking limit it refuses locally with
+// "Prompt is too long" and sends nothing. A rebuild imports zero usage everywhere, so
+// syncSharedSession stamps pi's measurement on the last assistant record.
+test("a resumed transcript is sized from the last nonzero assistant usage, else from its bytes", { timeout: 120_000 }, async () => {
+	const requests = [];
+	const api = await stubApi(requests);
+	const cwd = mkdtempSync(join(tmpdir(), "cc-resume-sizing-"));
+	const filler = "lorem ipsum dolor sit amet ".repeat(1000);
+	try {
+		for (const stamped of [false, true]) {
+			const session = createSession({ projectPath: cwd, model: MODEL });
+			// ~1M chars: far past haiku's window by byte estimate.
+			for (let i = 0; i < 40; i++) {
+				session.addUserMessage(`turn ${i}: ${filler}`);
+				session.addAssistantMessage([{ type: "text", text: `ack ${i}` }]);
+			}
+			if (stamped) {
+				session.records.findLast((r) => r.type === "assistant").message.usage =
+					{ input_tokens: 4, output_tokens: 50, cache_read_input_tokens: 20_000, cache_creation_input_tokens: 100 };
+			}
+			session.save();
+			const before = requests.length;
+			try {
+				// The SDK throws on the refusal's error result.
+				const outcome = await collect(query({
+					prompt: "Reply OK.",
+					options: providerOptions({
+						cwd, resume: session.sessionId, maxTurns: 1, persistSession: false,
+						env: { ...process.env, ANTHROPIC_BASE_URL: api.url, ENABLE_CLAUDEAI_MCP_SERVERS: "0", DISABLE_AUTO_COMPACT: "1" },
+					}),
+				})).then(({ result }) => result?.subtype, (error) => error.message);
+				if (stamped) {
+					assert.equal(outcome, "success");
+					assert.equal(requests.length - before, 1, "the stamped usage should let the request through");
+				} else {
+					assert.match(outcome, /Prompt is too long/);
+					assert.equal(requests.length - before, 0, "an all-zero transcript of this size should be refused locally");
+				}
+			} finally {
+				deleteSession(session.sessionId, cwd);
+			}
+		}
+	} finally {
+		api.close();
+		rmSync(cwd, { recursive: true, force: true });
+	}
+});
 
 // --- Native instruction exclusions ---
 

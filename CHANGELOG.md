@@ -15,6 +15,7 @@
 - **Fix: bash default timeout broke the prompt cache on rebuild (#203)** — The 120s default now applies when the command runs instead of being saved in pi's history, so rebuilt sessions match Claude Code's. Thanks @cad0p and @superninjv.
 - **Bump: Claude Agent SDK 0.3.308 (Claude Code 2.1.308)** — Claude Code's new per-request log in session files is turned off; it made them about a third larger.
 - **Debug: opt-in cache trace** — `CLAUDE_BRIDGE_TRACE_DIR` logs session decisions to help diagnose prompt-cache loss. See `diag/CACHE-TRACE.md`.
+- **Fix: "Prompt is too long" after a session rebuild** — a rebuilt Claude Code transcript carried zero usage on every record, so Claude Code sized the whole history from its bytes and refused a long session locally, before any request reached the API or a compressing proxy. That also broke pi's overflow recovery, whose summary call failed the same way. The rebuild now writes pi's last measured context usage on the final assistant record.
 
 ## 0.9.3 — 2026-10-13
 

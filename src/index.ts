@@ -4,7 +4,7 @@ import { buildSessionContext, isToolCallEventType, keyHint, VERSION as PI_VERSIO
 import { query, type EffortLevel, type SDKMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
 import type { Base64ImageSource, ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { Text } from "@earendil-works/pi-tui";
-import { createSession, deleteSession, getSessionPath } from "cc-session-io";
+import { createSession, deleteSession, getSessionPath, type AssistantRecord } from "cc-session-io";
 import { randomUUID } from "node:crypto";
 import { appendFileSync, mkdirSync, realpathSync, statSync } from "fs";
 import { dirname, join } from "path";
@@ -34,7 +34,7 @@ import { buildActionSummary, type ToolCallState } from "./askclaude-ui.js";
 import { askClaudeCallTags, askClaudeToolDescription, buildAskClaudeParams, resolveAskClaudeDefaults, resolveAskClaudeMode, type AskClaudeMode } from "./askclaude-schema.js";
 import { nonSystemMessages, toBridgeContext } from "./transcript.js";
 import { forgetSessionCwd, rememberSessionCwd, rememberSummarySession, sessionCwdFor, summarySessionFor } from "./session-cwd.js";
-import { updateUsage, type SdkUsage } from "./usage.js";
+import { lastContextUsage, updateUsage, type SdkUsage } from "./usage.js";
 import { rateLimitResponse } from "./rate-limit.js";
 import { bridgeRevision, packageVersion, setTraceNotifier, traceAssertReady, traceEvent, traceId, traceInput, traceQueryStart, traceSignalId, traceSnapshot, traceStrict } from "./cache-trace.js";
 
@@ -361,6 +361,24 @@ markRebuildHooks.add(markRebuildForSession);
  *  given pi session. */
 function sponsorMarkRebuildForSession(piSession: string | null, event: string): void {
 	for (const hook of markRebuildHooks) hook(piSession, event);
+}
+
+// Imported assistant records carry zero usage, which Claude Code skips when it sizes a
+// resumed session (see lastContextUsage). Stamp pi's measurement on the record imported
+// from the measured message, so Claude Code anchors there and estimates only the records
+// after it from their bytes. convertPiMessages drops only assistant turns with no content
+// and repairWithOrigin keeps every assistant, so each remaining one is exactly one record.
+function stampContextUsage(session: ReturnType<typeof createSession>, messages: Context["messages"]): void {
+	const measured = lastContextUsage(messages);
+	if (!measured) return;
+	let later = messages.slice(measured.index + 1).filter((m) => m.role === "assistant" && m.content.length > 0).length;
+	const records = session.records;
+	for (let i = records.length - 1; i >= 0; i--) {
+		if (records[i].type !== "assistant" || later-- > 0) continue;
+		(records[i] as AssistantRecord).message.usage = measured.usage;
+		debug(`stampContextUsage: record ${i} of ${records.length} ←`, JSON.stringify(measured.usage));
+		return;
+	}
 }
 
 // Pi doesn't pass tool results directly — it appends them to the context and calls
@@ -801,12 +819,14 @@ function syncSharedSession(
 			return { sessionId: state!.ccSessionId, targetSessionId, created: true, forkAt: cut.uuid, recorded, state, writable };
 		}
 		const suffix = importHistory(session, priors.slice(compared.cutCount), customToolNameToSdk, collectCarriedAttachments(transcript.slice(cut.index + 1)));
+		stampContextUsage(session, priors.slice(compared.cutCount));
 		recorded = { digests: [...recorded.digests, ...suffix.digests], uuids: [...recorded.uuids, ...suffix.uuids], cuttable: [...recorded.cuttable, ...suffix.cuttable] };
 		records = savePrefixSession(session, transcript.slice(0, cut.index + 1), cut.uuid);
 	} else {
 		// Nothing is kept, but the old transcript's @file expansions still belong to
 		// prompts pi kept unchanged (placeCarriedAttachments checks each one).
 		recorded = importHistory(session, priors, customToolNameToSdk, state ? collectCarriedAttachments(readTranscript(state)) : []);
+		stampContextUsage(session, priors);
 		session.save();
 		records = session.records.length;
 	}

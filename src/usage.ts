@@ -2,7 +2,7 @@
 // Logging-free like convert.ts — it returns what it derived and index.ts logs it.
 // Extracted from index.ts so tests can reach it without activating the extension.
 
-import { calculateCost, type Api, type AssistantMessage, type Model } from "@earendil-works/pi-ai";
+import { calculateCost, type Api, type AssistantMessage, type Message, type Model } from "@earendil-works/pi-ai";
 
 /**
  * The usage counters Claude Code reports, mirroring `Usage` / `MessageDeltaUsage` in
@@ -50,4 +50,49 @@ export function updateUsage(output: AssistantMessage, usage: SdkUsage, model: Mo
 	const report: UsageReport = { cachePct: promptTokens > 0 ? Math.round(output.usage.cacheRead / promptTokens * 100) : 0 };
 	if (reasoning != null) report.reasoning = reasoning;
 	return report;
+}
+
+/** The opening of the user message pi substitutes for compacted history
+ *  (`COMPACTION_SUMMARY_PREFIX` in pi-coding-agent's core/messages.js, not exported). */
+const COMPACTION_SUMMARY_PREFIX = "The conversation history before this point was compacted into the following summary:";
+
+function isCompactionSummary(msg: Message): boolean {
+	if (msg.role !== "user") return false;
+	const first = typeof msg.content === "string" ? msg.content : msg.content.find((b) => b.type === "text")?.text;
+	return first?.startsWith(COMPACTION_SUMMARY_PREFIX) ?? false;
+}
+
+/** Claude Code's usage counters with every field present, as written onto a transcript record. */
+export type ContextUsage = {
+	input_tokens: number;
+	output_tokens: number;
+	cache_read_input_tokens: number;
+	cache_creation_input_tokens: number;
+};
+
+/**
+ * The context size pi last measured in `messages`, as the counters Claude Code reads off an
+ * assistant record, with the index of the message that carries it; undefined when pi has no
+ * trustworthy measurement.
+ *
+ * Claude Code sizes a resumed session from the usage on its last assistant record with a
+ * nonzero total, and estimates everything after that record from the transcript's bytes. A
+ * rebuilt transcript carries zero usage on every record, so the whole history is estimated —
+ * and a long one that a proxy shrinks upstream is refused locally as "Prompt is too long"
+ * before any request is sent. Stamping pi's own measurement restores the anchor.
+ *
+ * Follows pi's context accounting: aborted and errored turns carry no usable usage, and an
+ * assistant from before the latest compaction measured the pre-compaction context.
+ */
+export function lastContextUsage(messages: readonly Message[]): { usage: ContextUsage; index: number } | undefined {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const msg = messages[i];
+		if (isCompactionSummary(msg)) return undefined;
+		if (msg.role !== "assistant" || msg.stopReason === "aborted" || msg.stopReason === "error" || !msg.usage) continue;
+		const { input, output, cacheRead, cacheWrite } = msg.usage;
+		if (input + output + cacheRead + cacheWrite > 0) {
+			return { usage: { input_tokens: input, output_tokens: output, cache_read_input_tokens: cacheRead, cache_creation_input_tokens: cacheWrite }, index: i };
+		}
+	}
+	return undefined;
 }

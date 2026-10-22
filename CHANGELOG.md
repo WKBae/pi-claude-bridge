@@ -15,6 +15,7 @@
 - **Fix: bash default timeout broke the prompt cache on rebuild (#203)** — The 120s default now applies when the command runs instead of being saved in pi's history, so rebuilt sessions match Claude Code's. Thanks @cad0p and @superninjv.
 - **Bump: Claude Agent SDK 0.3.308 (Claude Code 2.1.308)** — Claude Code's new per-request log in session files is turned off; it made them about a third larger.
 - **Debug: opt-in cache trace** — `CLAUDE_BRIDGE_TRACE_DIR` logs session decisions to help diagnose prompt-cache loss. See `diag/CACHE-TRACE.md`.
+- **Fix: /btw side questions asked while pi is idle** — pi-btw's side session embeds the system prompt pi renders between runs, which lacks the sections extensions add per run (`<acp_delegate>`, `<advisor_invocation_settings>`), so it matched no capture and failed with "prompt-capture: no capture …". The bridge now records that prompt when a run settles.
 
 ## 0.9.3 — 2026-10-13
 

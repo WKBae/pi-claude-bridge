@@ -20,4 +20,7 @@ process.env.PI_CODING_AGENT_SESSION_DIR = join(root, "sessions");
 process.env.CLAUDE_CONFIG_DIR = join(root, "claude");
 process.env.CLAUDE_BRIDGE_DEBUG_PATH = join(root, "claude-bridge.log");
 delete process.env.CLAUDE_BRIDGE_RECORD_STREAM;
+// The persisted pi→CC session links (src/session-links.ts) go here too, so a test
+// that plants a session mirror never writes into the real agent dir.
+process.env.CLAUDE_BRIDGE_SESSION_LINKS_PATH = join(root, "claude-bridge-sessions.json");
 process.on("exit", () => rmSync(root, { recursive: true, force: true }));

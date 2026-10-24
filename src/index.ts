@@ -1,13 +1,13 @@
-import { createAssistantMessageEventStream, type AssistantMessage, type AssistantMessageEventStream, type Context, type ImageContent, type Model, type SimpleStreamOptions, type TextContent, type Tool, type UserMessage } from "@earendil-works/pi-ai";
+import { createAssistantMessageEventStream, type AssistantMessage, type AssistantMessageEventStream, type Context, type Model, type SimpleStreamOptions, type Tool, type UserMessage } from "@earendil-works/pi-ai";
 import { getModels } from "@earendil-works/pi-ai/compat";
 import { buildSessionContext, keyHint, type ExtensionAPI, type ExtensionContext, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { query, type EffortLevel, type SDKMessage, type SDKUserMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
-import type { Base64ImageSource, ContentBlockParam } from "@anthropic-ai/sdk/resources";
+import type { ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { Text } from "@earendil-works/pi-tui";
 import { createSession, deleteSession, openSession, repairToolPairing, type AssistantRecord } from "cc-session-io";
 import { appendFileSync, mkdirSync, realpathSync, statSync } from "fs";
 import { dirname, join } from "path";
-import { PROVIDER_ID, messageContentToText, convertPiMessages } from "./convert.js";
+import { PROVIDER_ID, convertPiMessages, userTurnBlocks, userTurnText } from "./convert.js";
 import { debugLogPath, diagLogPath } from "./log-paths.js";
 import { applyLongContext, buildModels, claudeCodeModelId, type LongContextSettings, resolveModel as _resolveModel } from "./models.js";
 import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, renderSkillsBlock, skillsListedIn } from "./skills.js";
@@ -447,12 +447,8 @@ function turnStart(messages: Context["messages"]): number {
 function extractUserPrompt(messages: Context["messages"]): string | null {
 	const turn = messages.slice(turnStart(messages)) as UserMessage[];
 	if (turn.length === 0) return null;
-	// Drop empties before joining so an all-empty turn still yields "" and trips
-	// the caller's empty-prompt guard rather than sending bare newlines.
-	return turn
-		.map((m) => (typeof m.content === "string" ? m.content : messageContentToText(m.content)))
-		.filter((text) => text)
-		.join("\n");
+	// An all-empty turn yields "" and trips the caller's empty-prompt guard.
+	return userTurnText(turn);
 }
 
 /** Extract the current user turn as ContentBlockParam[] (preserving images).
@@ -461,46 +457,19 @@ function extractUserPromptBlocks(messages: Context["messages"]): ContentBlockPar
 	const turn = messages.slice(turnStart(messages)) as UserMessage[];
 	if (turn.length === 0) return null;
 
-	let hasImage = false;
-	const blocks: ContentBlockParam[] = [];
 	for (const message of turn) {
-		const content: (TextContent | ImageContent)[] = typeof message.content === "string"
-			? [{ type: "text", text: message.content }]
-			: message.content;
 		// Off-type content violates UserMessage's contract, so fail rather than
 		// degrade — but name the shape, since the cause is almost always another
 		// extension appending a malformed message, not this file.
-		if (!Array.isArray(content)) {
+		if (typeof message.content !== "string" && !Array.isArray(message.content)) {
 			throw new Error(
-				`extractUserPromptBlocks: user message content must be a string or block array, got ${typeof content} — likely a malformed message from another extension`,
+				`extractUserPromptBlocks: user message content must be a string or block array, got ${typeof message.content} — likely a malformed message from another extension`,
 			);
 		}
-		for (const block of content) {
-			if (block.type === "text" && block.text) {
-				blocks.push({ type: "text", text: block.text });
-			} else if (block.type === "image") {
-				// Guard before logging: data-less image blocks do occur, and reading
-				// .length off the missing field in the debug template would throw
-				// before this check ever runs (template args evaluate unconditionally).
-				if (!block.data || !block.mimeType) {
-					debug(`image block missing data or mimeType, skipping: keys=${Object.keys(block).join(",")}`);
-					continue;
-				}
-				debug(`image block: mimeType=${block.mimeType}, data length=${block.data.length}`);
-				hasImage = true;
-				blocks.push({
-					type: "image",
-					source: {
-						type: "base64",
-						media_type: block.mimeType as Base64ImageSource["media_type"],
-						data: block.data,
-					},
-				});
-			}
-		}
 	}
-	debug(`extractUserPromptBlocks: ${turn.length} msgs in turn, ${blocks.length} blocks, types=${blocks.map((b) => b.type).join(",")}`);
-	return hasImage ? blocks : null;
+	const blocks = userTurnBlocks(turn) as ContentBlockParam[] | null;
+	debug(`extractUserPromptBlocks: ${turn.length} msgs in turn, ${blocks ? `${blocks.length} blocks, types=${blocks.map((b) => b.type).join(",")}` : "no image"}`);
+	return blocks;
 }
 
 function newAssistantOutput(model: Model<any>, text: string, stopReason: AssistantMessage["stopReason"], errorMessage?: string): AssistantMessage {

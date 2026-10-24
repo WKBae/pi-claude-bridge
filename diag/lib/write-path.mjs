@@ -42,7 +42,11 @@ export function transcript(piMessages) {
 /** Prefix lengths at which every tool call issued so far has its result.
  *  Truncating mid-turn leaves repairToolPairing no choice but to stand in a
  *  synthetic stub for the results that have not arrived, so only settled
- *  prefixes can be expected to extend cleanly. */
+ *  prefixes can be expected to extend cleanly.
+ *
+ *  A cut inside a run of user messages is excluded too: the run is one prompt
+ *  and converts to one record, and the bridge never imports a history ending in
+ *  a user message, since the trailing run is the prompt (turnStart). */
 export function settledPrefixes(messages) {
 	const lengths = [];
 	const pending = new Set();
@@ -52,7 +56,8 @@ export function settledPrefixes(messages) {
 			for (const b of msg.content) if (b.type === "toolCall") pending.add(b.id);
 		}
 		if (msg.role === "toolResult") pending.delete(msg.toolCallId);
-		if (pending.size === 0) lengths.push(i + 1);
+		const splitsUserRun = msg.role === "user" && messages[i + 1]?.role === "user";
+		if (pending.size === 0 && !splitsUserRun) lengths.push(i + 1);
 	}
 	return lengths;
 }

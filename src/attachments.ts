@@ -45,6 +45,15 @@ const CONTENT_BEARING = new Set(["file"]);
 // moves to the newest prompt like the rest. Carrying replays exactly what the model
 // saw at session start. If the file changes mid-session CC appends a fresh copy to
 // a later prompt, as it does in a session that was never rebuilt.
+//
+// `deferred_tools_delta` and `deferred_tools_record` are how CC keeps a tool that
+// appeared mid-session deferred: the delta, on the prompt where the tool appeared,
+// renders the "tools just became available" system message with its
+// `tool_addition` blocks, and the record holds the wire definitions CC sends with
+// `defer_loading` from then on. A rebuilt session without them declares every tool
+// up front and drops that message, so the request differs from the tools onward.
+// Both are needed. `prompt_snapshot` is left out: it freezes the system prompt,
+// and the two records keep the tools deferred without it.
 const SESSION_CONTEXT = new Set([
 	"environment",
 	"model",
@@ -55,6 +64,8 @@ const SESSION_CONTEXT = new Set([
 	"date",
 	"credential_org",
 	"instructions",
+	"deferred_tools_delta",
+	"deferred_tools_record",
 ]);
 
 type PromptAnchor = {

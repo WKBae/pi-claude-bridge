@@ -17,11 +17,7 @@ import { messageContentToText } from "./convert.js";
 // `edited_text_file` is deliberately excluded even though it also carries file
 // content. CC writes one after editing a file, and the edit itself is already in
 // pi's history as a tool call and its result, so the attachment duplicates context
-// the rebuild reproduces anyway. It also usually hangs off a *tool result* record
-// rather than a prompt, which has no position in the ordinal scheme below — on
-// real sessions that left 81 of them unresolvable (see
-// diag/attachment-coverage.mjs). Half-carrying a kind is worse than not claiming
-// it: the ones that slipped through would be an arbitrary subset.
+// the rebuild reproduces anyway.
 //
 // Everything else CC rewrites every turn (`skill_listing`, `task_reminder`,
 // `agent_listing_delta`, `mcp_instructions_delta`, …) and loses nothing.
@@ -37,6 +33,11 @@ const CONTENT_BEARING = new Set(["file"]);
 // prefix (text-identical; one message may switch list/string form, as it does on
 // any live turn) and the history is read from cache: measured 26,417 read / 875
 // written vs 12,722 / 14,423 without, on the same rebuild.
+//
+// `total_tokens_reminder` is also written after every tool result, hanging off the
+// tool-result record. Dropped there, the rebuilt request loses the `<total_tokens>`
+// system message that followed the result, and everything from that point on
+// misses the cache.
 //
 // `instructions` is the memory/instruction-file block (auto-memory MEMORY.md, and
 // project instruction files when CC loads them). It only exists when the folder has
@@ -56,15 +57,29 @@ const SESSION_CONTEXT = new Set([
 	"instructions",
 ]);
 
-export type CarriedAttachment = {
-	attachment: { type: string; [key: string]: unknown };
+type PromptAnchor = {
 	/** Position of the parent among the session's text-bearing user records. */
 	userOrdinal: number;
 	/** That record's text, to verify the ordinal still points at the same turn. */
 	parentText: string;
 };
+/** A tool-result parent, keyed by a tool-use id it answers. */
+type ToolResultAnchor = { toolUseId: string };
+
+export type CarriedAttachment = {
+	attachment: { type: string; [key: string]: unknown };
+} & (PromptAnchor | ToolResultAnchor);
 
 type Rec = Record<string, unknown>;
+
+/** The first tool-use id a user record answers, if it holds tool results. */
+function toolResultId(record: Rec): string | undefined {
+	if (record.type !== "user") return undefined;
+	const content = (record.message as Rec | undefined)?.content;
+	if (!Array.isArray(content)) return undefined;
+	const block = content.find((b) => (b as Rec)?.type === "tool_result") as Rec | undefined;
+	return typeof block?.tool_use_id === "string" ? block.tool_use_id : undefined;
+}
 
 /** A user record holding a prompt, as opposed to one holding tool results. */
 function userPromptText(record: Rec): string | undefined {
@@ -77,7 +92,8 @@ function userPromptText(record: Rec): string | undefined {
 
 /**
  * Content-bearing attachments in a session, each tagged with where its parent
- * sits among the text-bearing user records.
+ * sits: a prompt by its position among the text-bearing user records, or a
+ * tool-result record by the tool-use id it answers.
  *
  * The ordinal is the mapping key rather than the record index: a rebuild does not
  * reproduce the old record list one-for-one — `importMessages` splits a message
@@ -90,8 +106,7 @@ function userPromptText(record: Rec): string | undefined {
  * do with at-mentions; only their position in the conversation matters here.
  */
 export function collectCarriedAttachments(records: readonly JsonlRecord[]): CarriedAttachment[] {
-	const ordinalOf = new Map<string, number>();
-	const textOf = new Map<string, string>();
+	const anchorOf = new Map<string, PromptAnchor | ToolResultAnchor>();
 	let ordinal = 0;
 	const carried: CarriedAttachment[] = [];
 
@@ -99,25 +114,28 @@ export function collectCarriedAttachments(records: readonly JsonlRecord[]): Carr
 		const record = raw as Rec;
 		const prompt = userPromptText(record);
 		if (prompt !== undefined) {
-			ordinalOf.set(record.uuid as string, ordinal++);
-			textOf.set(record.uuid as string, prompt);
+			anchorOf.set(record.uuid as string, { userOrdinal: ordinal++, parentText: prompt });
+			continue;
+		}
+		const toolUseId = toolResultId(record);
+		if (toolUseId !== undefined) {
+			anchorOf.set(record.uuid as string, { toolUseId });
 			continue;
 		}
 		if (record.type !== "attachment") continue;
 		const parent = record.parentUuid as string | null;
-		// Attachments chain to each other — a run of them hangs off one prompt, and
+		// Attachments chain to each other — a run of them hangs off one message, and
 		// 63 of 179 in real sessions parent to another attachment rather than to a
-		// message. Inherit the ordinal so the whole run keys to the prompt that
+		// message. Inherit the anchor so the whole run keys to the message that
 		// caused it. Recorded for every attachment, not just the ones carried, since
 		// a content-bearing one can chain off a `skill_listing` we ignore.
-		if (parent === null || !ordinalOf.has(parent)) continue;
-		const inherited = ordinalOf.get(parent)!;
-		ordinalOf.set(record.uuid as string, inherited);
-		textOf.set(record.uuid as string, textOf.get(parent)!);
+		const anchor = parent === null ? undefined : anchorOf.get(parent);
+		if (!anchor) continue;
+		anchorOf.set(record.uuid as string, anchor);
 
 		const attachment = record.attachment as { type: string; [key: string]: unknown } | undefined;
 		if (!attachment || !(CONTENT_BEARING.has(attachment.type) || SESSION_CONTEXT.has(attachment.type))) continue;
-		carried.push({ attachment, userOrdinal: inherited, parentText: textOf.get(parent)! });
+		carried.push({ attachment, ...anchor });
 	}
 	return carried;
 }
@@ -131,16 +149,23 @@ export function collectCarriedAttachments(records: readonly JsonlRecord[]): Carr
  * Deliberately conservative: attaching a file to the wrong turn tells the model it
  * saw something at a point it did not, which is worse than the loss this exists to
  * prevent. So the ordinal has to land on a prompt whose text still matches; any
- * disagreement is reported and dropped rather than approximated.
+ * disagreement is reported and dropped rather than approximated. A tool-use id
+ * is unique, so a tool-result anchor only has to find the message answering it.
  */
 export function placeCarriedAttachments(
 	carried: readonly CarriedAttachment[],
 	messages: readonly { role: string; content: unknown }[],
 ): { attachments: ImportAttachment[]; skipped: string[] } {
 	const prompts: { index: number; text: string }[] = [];
+	const resultIndex = new Map<string, number>();
 	messages.forEach((msg, index) => {
 		if (msg.role !== "user") return;
-		if (Array.isArray(msg.content) && msg.content.some((b) => (b as Rec)?.type === "tool_result")) return;
+		if (Array.isArray(msg.content) && msg.content.some((b) => (b as Rec)?.type === "tool_result")) {
+			for (const b of msg.content as Rec[]) {
+				if (b?.type === "tool_result") resultIndex.set(b.tool_use_id as string, index);
+			}
+			return;
+		}
 		const text = messageContentToText(msg.content as never);
 		if (text) prompts.push({ index, text });
 	});
@@ -149,6 +174,12 @@ export function placeCarriedAttachments(
 	const skipped: string[] = [];
 	for (const item of carried) {
 		const name = String(item.attachment.filename ?? item.attachment.type);
+		if ("toolUseId" in item) {
+			const index = resultIndex.get(item.toolUseId);
+			if (index === undefined) skipped.push(`${name}: result for ${item.toolUseId} is no longer in history`);
+			else attachments.push({ afterIndex: index, attachment: item.attachment });
+			continue;
+		}
 		const candidate = prompts[item.userOrdinal];
 		if (!candidate) {
 			skipped.push(`${name}: prompt #${item.userOrdinal} is no longer in history`);

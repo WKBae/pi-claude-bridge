@@ -532,8 +532,10 @@ test("--thinking-display summarized is still an accepted flag value", { timeout:
 // --- Captured request contracts ---
 
 /** One-turn stub API: records every /v1/messages body, answers a canned "OK" SSE.
- *  Lets a contract assert on the exact request CC builds, at zero API cost. */
-function stubApi(requests) {
+ *  Lets a contract assert on the exact request CC builds, at zero API cost.
+ *  `firstTurn(event)`, when given, supplies the first response's events after
+ *  message_start instead. */
+function stubApi(requests, firstTurn) {
 	const server = createServer((req, res) => {
 		const chunks = [];
 		req.on("data", (c) => chunks.push(c));
@@ -543,8 +545,13 @@ function stubApi(requests) {
 				requests.push(body);
 				const event = (name, obj) => `event: ${name}\ndata: ${JSON.stringify(obj)}\n\n`;
 				res.writeHead(200, { "content-type": "text/event-stream" });
+				const start = event("message_start", { type: "message_start", message: { id: `msg_stub_${requests.length}`, type: "message", role: "assistant", content: [], model: body.model, stop_reason: null, stop_sequence: null, usage: { input_tokens: 10, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } } });
+				if (firstTurn && requests.length === 1) {
+					res.end(start + firstTurn(event));
+					return;
+				}
 				res.end(
-					event("message_start", { type: "message_start", message: { id: `msg_stub_${requests.length}`, type: "message", role: "assistant", content: [], model: body.model, stop_reason: null, stop_sequence: null, usage: { input_tokens: 10, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } } })
+					start
 					+ event("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })
 					+ event("ping", { type: "ping" })
 					+ event("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "OK" } })
@@ -565,6 +572,67 @@ function stubApi(requests) {
 /** cache_control markers are breakpoint directives, not cache-keyed content — CC 2.1.280
  *  moves them (and a 1h ttl) between turns, so payload comparisons strip them. */
 const sansCacheControl = (m) => JSON.parse(JSON.stringify(m, (_k, v) => (v === null || v === undefined) ? v : (typeof v === "object" && !Array.isArray(v) ? Object.fromEntries(Object.entries(v).filter(([key]) => key !== "cache_control")) : v)));
+
+// --- Tool input coercion ---
+
+test("the streamed assistant message carries the tool input CC coerced to the schema, before content_block_stop", { timeout: 120_000 }, async () => {
+	// The model streamed an array argument as a JSON string. CC coerces it to the
+	// tool's schema and records, re-sends, and dispatches the array, while a string
+	// argument that only looks like JSON stays a string. The bridge builds pi's tool
+	// call from this message (keepCcToolInputs), so it has to arrive before the
+	// block's content_block_stop and match what CC re-sends.
+	const ranges = [{ startId: "m00001", endId: "m00002", summary: "s" }];
+	const raw = JSON.stringify({ content: JSON.stringify(ranges), note: "[1,2]" });
+	const coerced = { content: ranges, note: "[1,2]" };
+	const requests = [];
+	const api = await stubApi(requests, (event) =>
+		event("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "toolu_coerce", name: "mcp__custom-tools__compress", input: {} } })
+		+ event("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: raw.slice(0, 20) } })
+		+ event("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: raw.slice(20) } })
+		+ event("content_block_stop", { type: "content_block_stop", index: 0 })
+		+ event("message_delta", { type: "message_delta", delta: { stop_reason: "tool_use", stop_sequence: null }, usage: { output_tokens: 5 } })
+		+ event("message_stop", { type: "message_stop" }));
+	const calls = [];
+	const compress = {
+		name: "compress", description: "Folds message ranges.",
+		inputSchema: { type: "object", properties: {
+			content: { anyOf: [{ type: "array", items: { type: "object" } }, { type: "string" }] },
+			note: { type: "string" },
+		}, required: ["content"] },
+	};
+	const cwd = mkdtempSync(join(tmpdir(), "cc-coerce-"));
+	const order = [];
+	let assistantInput;
+	try {
+		for await (const message of query({
+			prompt: "go",
+			options: providerOptions({
+				cwd, maxTurns: 3, persistSession: false, includePartialMessages: true,
+				env: { ...process.env, ANTHROPIC_BASE_URL: api.url, ENABLE_CLAUDEAI_MCP_SERVERS: "0", DISABLE_AUTO_COMPACT: "1" },
+				mcpServers: toolServer([compress], calls),
+			}),
+		})) {
+			if (message.type === "stream_event") {
+				if (message.event.index === 0 && message.event.type === "content_block_stop" && requests.length === 1) order.push("content_block_stop");
+			} else if (message.type === "assistant") {
+				const block = message.message.content.find((b) => b.type === "tool_use");
+				if (block) {
+					assistantInput = block.input;
+					order.push("assistant");
+				}
+			}
+		}
+	} finally {
+		api.close();
+		rmSync(cwd, { recursive: true, force: true });
+	}
+
+	assert.deepStrictEqual(assistantInput, coerced);
+	assert.deepStrictEqual(order, ["assistant", "content_block_stop"]);
+	assert.deepStrictEqual(calls.map((call) => call.args), [coerced]);
+	const resent = requests[1]?.messages.flatMap((m) => Array.isArray(m.content) ? m.content : []).find((b) => b.type === "tool_use");
+	assert.deepStrictEqual(resent?.input, coerced);
+});
 
 // --- Native instruction exclusions ---
 

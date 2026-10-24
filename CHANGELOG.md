@@ -1,5 +1,9 @@
 # Changelog
 
+## UNRELEASED
+
+- **Fix: tool calls record the input Claude Code ran** — Claude Code coerces a streamed tool input to the tool's schema (an array streamed as a JSON string becomes an array) before running and re-sending it. pi recorded the raw stream instead, so a rebuilt session re-sent a different tool call and missed the prompt cache from that call on.
+
 ## 0.9.3 — 2026-10-13
 
 - **Remove: compaction and branch-summary takeovers (#189)** — pi runs them natively; the bridge routes summary calls to its isolated path. Other compaction extensions should now work. Resolves #115. Thanks @sonSunnoi.

@@ -54,6 +54,22 @@ describe("collectCarriedAttachments", () => {
 		assert.ok(carried.every((c) => c.userOrdinal === 0 && c.parentText === "first"));
 	});
 
+	it("keeps the records that defer a tool added mid-session on the prompt where it appeared", () => {
+		// Dropped, the rebuilt session declares the late tool up front and loses the
+		// "tools just became available" message, so the request misses from the tools on.
+		const carried = collectCarriedAttachments([
+			user("u1", "first"),
+			attach("s1", "u1", "prompt_snapshot"),
+			user("u2", "second"),
+			attach("d1", "u2", "deferred_tools_delta"),
+			attach("t1", "d1", "total_tokens_reminder"),
+			attach("r1", "t1", "deferred_tools_record"),
+		]);
+		assert.deepEqual(carried.map((c) => c.attachment.type),
+			["deferred_tools_delta", "total_tokens_reminder", "deferred_tools_record"]);
+		assert.ok(carried.every((c) => c.userOrdinal === 1 && c.parentText === "second"));
+	});
+
 	it("carries the instruction-file block whole, so the rebuilt prompt shows the model the same memory", () => {
 		// Only present in folders with a memory dir or instruction files; before it was
 		// carried, CC re-attached it after credential_org on the newest prompt and the

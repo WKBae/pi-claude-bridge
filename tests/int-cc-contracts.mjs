@@ -661,3 +661,78 @@ test("includeGitInstructions:false strips gitStatus and keeps the preset static 
 		rmSync(repo, { recursive: true, force: true });
 	}
 });
+
+// --- Tools added mid-session ---
+
+test("a tool added mid-session stays deferred on a rebuild only with its deferred_tools records", { timeout: 240_000 }, async () => {
+	// A first-party session that gains a tool between turns sends it with
+	// defer_loading and announces it in a system message of tool_addition blocks.
+	// A resumed session decides this from the deferred_tools_delta and
+	// deferred_tools_record attachments, not from the tools it was started with, so
+	// src/attachments.ts carries both and leaves prompt_snapshot behind.
+	const requests = [];
+	const api = await stubApi(requests);
+	const cwd = mkdtempSync(join(tmpdir(), "cc-deferred-tools-"));
+	// A stub API is neither a first-party host nor covered by the per-model flag
+	// that turns mid-conversation system messages on, so both are forced here.
+	const env = {
+		...process.env, ANTHROPIC_BASE_URL: api.url, ENABLE_CLAUDEAI_MCP_SERVERS: "0", DISABLE_AUTO_COMPACT: "1",
+		_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL: "1", CLAUDE_CODE_FORCE_MID_CONVERSATION_SYSTEM: "1",
+	};
+	// The bridge's shape: a streamed prompt, a fresh CLI per turn, resumed by id.
+	const turn = async (text, names, resume) => {
+		let finish;
+		const finished = new Promise((resolve) => { finish = resolve; });
+		async function* prompt() {
+			yield { type: "user", message: { role: "user", content: [{ type: "text", text }] }, parent_tool_use_id: null };
+			await finished;
+		}
+		let sessionId;
+		for await (const message of query({ prompt: prompt(), options: providerOptions({
+			cwd, env, maxTurns: 1, systemPrompt: { type: "preset", preset: "claude_code" }, ...(resume ? { resume } : {}),
+			mcpServers: toolServer(names.map(noArgTool), []),
+		}) })) {
+			if (message.type === "system" && message.subtype === "init") sessionId = message.session_id;
+			if (message.type === "result") finish();
+		}
+		return { sessionId, request: sansCacheControl(requests.at(-1)) };
+	};
+	const rebuildWith = async (records, types) => {
+		const session = createSession({ projectPath: cwd, model: MODEL });
+		const messages = [];
+		const attachments = [];
+		for (const record of records) {
+			if ((record.type === "user" || record.type === "assistant") && !record.isMeta) {
+				messages.push({ role: record.message.role, content: record.message.content });
+			} else if (record.type === "attachment" && types.includes(record.attachment.type)) {
+				attachments.push({ afterIndex: messages.length - 1, attachment: record.attachment });
+			}
+		}
+		session.importMessages(repairToolPairing(messages), { attachments });
+		session.save();
+		return (await turn("three", ["alpha", "beta"], session.sessionId)).request;
+	};
+	const toolsOf = (request) => request.tools.map((t) => `${t.name}${t.defer_loading ? "*" : ""}`);
+	try {
+		const first = await turn("one", ["alpha"]);
+		await turn("two", ["alpha", "beta"], first.sessionId);
+		const records = openSession({ sessionId: first.sessionId, projectPath: cwd }).records;
+		const live = (await turn("three", ["alpha", "beta"], first.sessionId)).request;
+		assert.ok(toolsOf(live).includes("mcp__custom-tools__beta*"), `beta was not deferred live: ${toolsOf(live)}`);
+		assert.ok(live.messages.some((m) => Array.isArray(m.content) && m.content.some((b) => b.type === "tool_addition")),
+			"the live request did not announce beta with tool_addition blocks");
+
+		// The session-start context goes along in both, as the bridge carries it.
+		const sessionStart = ["environment", "model", "total_tokens_reminder", "session_context", "date", "credential_org"];
+		const carried = await rebuildWith(records, [...sessionStart, "deferred_tools_delta", "deferred_tools_record"]);
+		assert.deepEqual(carried.tools, live.tools);
+		assert.deepEqual(carried.messages, live.messages);
+
+		const bare = await rebuildWith(records, sessionStart);
+		assert.ok(toolsOf(bare).includes("mcp__custom-tools__beta"),
+			`a rebuild without the records now defers beta on its own (${toolsOf(bare)}) — the carry may be redundant`);
+	} finally {
+		api.close();
+		rmSync(cwd, { recursive: true, force: true });
+	}
+});

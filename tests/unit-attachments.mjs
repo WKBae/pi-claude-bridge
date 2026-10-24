@@ -6,9 +6,9 @@ import assert from "node:assert/strict";
 import { collectCarriedAttachments, placeCarriedAttachments } from "../src/attachments.js";
 
 const user = (uuid, text) => ({ type: "user", uuid, message: { role: "user", content: [{ type: "text", text }] } });
-const toolResultUser = (uuid) => ({
+const toolResultUser = (uuid, toolUseId = "t1") => ({
 	type: "user", uuid,
-	message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "ok" }] },
+	message: { role: "user", content: [{ type: "tool_result", tool_use_id: toolUseId, content: "ok" }] },
 });
 const attach = (uuid, parentUuid, type, filename) => ({
 	type: "attachment", uuid, parentUuid, attachment: { type, filename },
@@ -24,8 +24,7 @@ describe("collectCarriedAttachments", () => {
 			attach("a4", "u1", "edited_text_file", "/b.js"),
 		]);
 		// edited_text_file is deliberately not carried: the edit is already in pi's
-		// history as a tool call, and it usually hangs off a tool-result record that
-		// has no prompt ordinal. See diag/attachment-coverage.mjs.
+		// history as a tool call.
 		assert.deepEqual(carried.map((c) => c.attachment.filename), ["/a.js"]);
 	});
 
@@ -69,6 +68,21 @@ describe("collectCarriedAttachments", () => {
 		assert.equal(carried[0].userOrdinal, 0);
 	});
 
+	it("keys a reminder after a tool result to that result's tool-use id", () => {
+		// CC writes a total_tokens_reminder after each tool result. Dropped, the
+		// rebuilt request loses the `<total_tokens>` message there and misses the
+		// cache from that point on.
+		const carried = collectCarriedAttachments([
+			user("u1", "first"),
+			toolResultUser("r1", "toolu_a"),
+			attach("a1", "r1", "total_tokens_reminder"),
+			attach("a2", "a1", "edited_text_file", "/b.js"),
+			attach("a3", "a2", "file", "/c.js"),
+		]);
+		assert.deepEqual(carried.map((c) => c.attachment.type), ["total_tokens_reminder", "file"]);
+		assert.ok(carried.every((c) => c.toolUseId === "toolu_a" && c.userOrdinal === undefined));
+	});
+
 	it("ignores an attachment whose parent is not a prompt", () => {
 		const carried = collectCarriedAttachments([
 			user("u1", "first"),
@@ -104,6 +118,29 @@ describe("placeCarriedAttachments", () => {
 		const { attachments, skipped } = placeCarriedAttachments(carried, [{ role: "user", content: "first" }]);
 		assert.equal(attachments.length, 0);
 		assert.match(skipped[0], /no longer in history/);
+	});
+
+	it("resolves a tool-use id to the message holding its result", () => {
+		// A rebuild collects a turn's results into one message; CC wrote one record
+		// per result, so the id can be any of them.
+		const reminder = { attachment: { type: "total_tokens_reminder" }, toolUseId: "toolu_b" };
+		const { attachments, skipped } = placeCarriedAttachments([reminder], [
+			{ role: "user", content: "first" },
+			{ role: "assistant", content: [{ type: "tool_use", id: "toolu_a" }, { type: "tool_use", id: "toolu_b" }] },
+			{ role: "user", content: [
+				{ type: "tool_result", tool_use_id: "toolu_a", content: "ok" },
+				{ type: "tool_result", tool_use_id: "toolu_b", content: "ok" },
+			] },
+		]);
+		assert.equal(skipped.length, 0);
+		assert.deepEqual(attachments, [{ afterIndex: 2, attachment: reminder.attachment }]);
+	});
+
+	it("drops it when that tool result is no longer in history", () => {
+		const reminder = { attachment: { type: "total_tokens_reminder" }, toolUseId: "toolu_gone" };
+		const { attachments, skipped } = placeCarriedAttachments([reminder], [{ role: "user", content: "first" }]);
+		assert.equal(attachments.length, 0);
+		assert.match(skipped[0], /toolu_gone is no longer in history/);
 	});
 });
 

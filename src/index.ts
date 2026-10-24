@@ -1558,9 +1558,10 @@ function processStreamEvent(
 		} else if (block.type === "toolCall") {
 			c.turnSawToolCall = true;
 			block.arguments = mapToolArgs(
-				block.name, parsePartialJson(block.partialJson, block.arguments),
+				block.name, block.ccInput ?? parsePartialJson(block.partialJson, block.arguments),
 			);
 			delete block.partialJson;
+			delete block.ccInput;
 			c.currentPiStream!.push({ type: "toolcall_end", contentIndex: index, toolCall: block, partial: c.turnOutput });
 		}
 		return;
@@ -1643,10 +1644,24 @@ function dropAbandonedStreamBlocks(c: QueryContext, why: string): void {
 	c.turnStreamOpen = false;
 }
 
-// The SDK always yields `assistant` messages (completed content blocks) after streaming.
-// When stream_events already delivered the content, this is a no-op. But after
-// resetTurnState (e.g. tool result delivery), if the next turn's assistant message
-// arrives before any stream_events, this is the primary content path. Must maintain
+// Claude Code coerces a streamed tool input to the tool's schema (an array that
+// arrived as a JSON string becomes an array, "3" becomes 3) and records, re-sends,
+// and dispatches the coerced input. The streamed assistant message carrying the
+// block arrives before its content_block_stop, so the tool call pi records takes
+// this input instead of the raw stream, and a rebuilt history sends what CC sent.
+function keepCcToolInputs(content: any[], c: QueryContext): void {
+	for (const part of content) {
+		if (part.type !== "tool_use" || !part.input) continue;
+		const block = c.turnBlocks.find((b: any) => b.type === "toolCall" && b.id === part.id && "partialJson" in b);
+		if (block) block.ccInput = part.input;
+	}
+}
+
+// The SDK always yields `assistant` messages (completed content blocks) alongside
+// streaming. When stream_events already delivered the content, they only supply
+// Claude Code's coerced tool inputs (keepCcToolInputs). But after resetTurnState
+// (e.g. tool result delivery), if the next turn's assistant message arrives before
+// any stream_events, this is the primary content path. Must maintain
 // the same stream lifecycle as processStreamEvent — including ending the stream on
 // tool_use to prevent deadlock with the MCP handler.
 //
@@ -1685,7 +1700,11 @@ function processAssistantMessage(message: SDKMessage, model: Model<any>, customT
 		// Drop the stalled stream's partial blocks if it never stopped. Deliberately
 		// deliver even if it stopped, at the risk of duplication if CC renumbers it.
 		const id = assistantMsg.id;
-		if (!id || !c.turnStreamMessageId || id === c.turnStreamMessageId) return;
+		if (id && id === c.turnStreamMessageId) {
+			keepCcToolInputs(assistantMsg.content, c);
+			return;
+		}
+		if (!id || !c.turnStreamMessageId) return;
 		if (c.turnStreamOpen) dropAbandonedStreamBlocks(c, `non-streaming fallback ${id}`);
 	}
 	c.turnToolCallIds = [];

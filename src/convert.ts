@@ -1,7 +1,7 @@
 // Pure pi→Anthropic message conversion helpers.
 // Extracted so they can be tested without pulling in the full extension runtime.
 
-import type { Message as PiMessage } from "@earendil-works/pi-ai";
+import type { Message as PiMessage, UserMessage } from "@earendil-works/pi-ai";
 import type { Message as SessionMessage } from "cc-session-io";
 import { pascalCase } from "change-case";
 import { MCP_TOOL_PREFIX } from "./skills.js";
@@ -67,6 +67,55 @@ export function messageContentToText(
 	return hasText ? parts.join("\n") : "";
 }
 
+/** A user turn as one prompt's text: each message flattened, empties dropped,
+ *  joined by newlines. Dropping empties before joining keeps an all-empty turn
+ *  at "" instead of bare newlines. */
+export function userTurnText(turn: readonly UserMessage[]): string {
+	return turn
+		.map((m) => (typeof m.content === "string" ? m.content : messageContentToText(m.content)))
+		.filter((text) => text)
+		.join("\n");
+}
+
+export type PromptBlock =
+	| { type: "text"; text: string }
+	| { type: "image"; source: { type: "base64"; media_type: string; data: string } };
+
+/** A user turn as content blocks, each text and image block kept as its own, or
+ *  null when it carries no image: a text-only turn is sent as userTurnText.
+ *  Image blocks missing data or a MIME type are skipped. */
+export function userTurnBlocks(turn: readonly UserMessage[]): PromptBlock[] | null {
+	let hasImage = false;
+	const blocks: PromptBlock[] = [];
+	for (const message of turn) {
+		const content = typeof message.content === "string" ? [{ type: "text" as const, text: message.content }] : message.content;
+		if (!Array.isArray(content)) continue;
+		for (const block of content) {
+			if (block.type === "text" && block.text) {
+				blocks.push({ type: "text", text: block.text });
+			} else if (block.type === "image" && block.data && block.mimeType) {
+				hasImage = true;
+				blocks.push({ type: "image", source: { type: "base64", media_type: block.mimeType, data: block.data } });
+			}
+		}
+	}
+	return hasImage ? blocks : null;
+}
+
+/** A run of consecutive user messages as the one user message pi sent live for
+ *  it: the provider sends the trailing run as a single prompt built by
+ *  userTurnText or userTurnBlocks, and Claude Code records it as one. Imported
+ *  as separate messages, the run reaches the API as one block per message after
+ *  Claude Code merges adjacent user records, which breaks the cached prefix at
+ *  that turn. */
+function userTurnContent(turn: readonly UserMessage[]): string | PromptBlock[] {
+	const blocks = userTurnBlocks(turn);
+	if (blocks) return blocks;
+	const text = userTurnText(turn);
+	if (text) return turn.every((m) => typeof m.content === "string") ? text : [{ type: "text", text }];
+	return turn.some((m) => Array.isArray(m.content)) ? "[image]" : "[empty]";
+}
+
 // Tool results are flattened to text, which is how Claude Code stores most of
 // them. Images are the exception: they have no text form, so a result carrying
 // one keeps the block array shape instead (also what CC writes for screenshots).
@@ -115,23 +164,22 @@ export function convertPiMessages(
 	let turnResults: { role: "user"; content: Array<Record<string, unknown>> } | null = null;
 	let turnAssistantIdx: number | null = null;
 
+	// Consecutive user messages are one prompt (see userTurnContent). The run is
+	// pi's adjacency, not the output's: a dropped aborted turn between two prompts
+	// still separates them, as it did live.
+	let userRun: UserMessage[] = [];
+	const flushUserRun = () => {
+		if (userRun.length) anthropicMessages.push({ role: "user", content: userTurnContent(userRun) });
+		userRun = [];
+	};
+
 	for (const msg of messages) {
 		if (msg.role === "user") {
-			if (typeof msg.content === "string") {
-				anthropicMessages.push({ role: "user", content: msg.content || "[empty]" });
-			} else if (Array.isArray(msg.content)) {
-				const parts = [];
-				for (const block of msg.content) {
-					if (block.type === "text" && block.text) parts.push({ type: "text", text: block.text });
-					else if (block.type === "image" && block.data && block.mimeType) {
-						parts.push({ type: "image", source: { type: "base64", media_type: block.mimeType, data: block.data } });
-					}
-				}
-				anthropicMessages.push({ role: "user", content: parts.length ? parts : "[image]" });
-			} else {
-				anthropicMessages.push({ role: "user", content: "[empty]" });
-			}
-		} else if (msg.role === "assistant") {
+			userRun.push(msg);
+			continue;
+		}
+		flushUserRun();
+		if (msg.role === "assistant") {
 			const content = Array.isArray(msg.content) ? msg.content : [];
 			const blocks = [];
 			for (const block of content) {
@@ -217,6 +265,7 @@ export function convertPiMessages(
 			}
 		}
 	}
+	flushUserRun();
 
 	return { anthropicMessages, sanitizedIds, dropped };
 }

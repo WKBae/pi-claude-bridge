@@ -450,20 +450,20 @@ describe("aborted assistant turns", () => {
 	// The prompt cache is keyed on exact prefix bytes, so a rebuild must reproduce
 	// the sequence Claude Code already cached. An aborted turn contributes nothing
 	// live, so standing a placeholder in for it on rebuild diverged at that index
-	// and cost every downstream cached token. See eli/todos.md.
+	// and cost every downstream cached token. See eli/todos.md. The two asks were
+	// separate live prompts, so they stay separate records.
 	it("rebuilding across an aborted turn preserves the cached prefix", () => {
-		const live = convert([
-			{ role: "user", content: [{ type: "text", text: "first ask" }] },
-			{ role: "user", content: [{ type: "text", text: "second ask" }] },
-			{ role: "assistant", content: [{ type: "text", text: "answer" }] },
-		]);
 		const rebuilt = convert([
 			{ role: "user", content: [{ type: "text", text: "first ask" }] },
 			{ role: "assistant", content: [] },
 			{ role: "user", content: [{ type: "text", text: "second ask" }] },
 			{ role: "assistant", content: [{ type: "text", text: "answer" }] },
 		]);
-		assert.deepEqual(rebuilt, live);
+		assert.deepEqual(rebuilt, [
+			{ role: "user", content: [{ type: "text", text: "first ask" }] },
+			{ role: "user", content: [{ type: "text", text: "second ask" }] },
+			{ role: "assistant", content: [{ type: "text", text: "answer" }] },
+		]);
 	});
 
 	it("a result stranded after an aborted turn still lands on the real assistant", () => {
@@ -474,6 +474,58 @@ describe("aborted assistant turns", () => {
 		]);
 		assert.deepEqual(result.map((m) => m.role), ["assistant", "user"]);
 		assert.equal(result[1].content[0].tool_use_id, "t1");
+	});
+});
+
+// The provider sends a turn's run of user messages as one prompt, and Claude
+// Code records it as one message. Rebuilt as one record per pi message, Claude
+// Code merges them on load into one block per message, so the rebuilt prompt
+// no longer matches the cached one from that turn on.
+describe("a run of user messages converts as the prompt sent live", () => {
+	it("joins a text run into one text block", () => {
+		const result = convert([
+			{ role: "user", content: "ask" },
+			{ role: "user", content: [{ type: "text", text: "note" }, { type: "text", text: "more" }] },
+			{ role: "user", content: "" },
+			{ role: "assistant", content: [{ type: "text", text: "answer" }] },
+		]);
+		assert.deepEqual(result.map((m) => m.role), ["user", "assistant"]);
+		assert.deepEqual(result[0].content, [{ type: "text", text: "ask\nnote\nmore" }]);
+	});
+
+	it("keeps a run of strings a string", () => {
+		const result = convert([
+			{ role: "user", content: "ask" },
+			{ role: "user", content: "note" },
+		]);
+		assert.deepEqual(result, [{ role: "user", content: "ask\nnote" }]);
+	});
+
+	it("falls back to a placeholder when the run has no text", () => {
+		assert.deepEqual(convert([
+			{ role: "user", content: "" },
+			{ role: "user", content: [{ type: "image", mimeType: "image/png" }] },
+		])[0].content, "[image]");
+		assert.deepEqual(convert([
+			{ role: "user", content: "" },
+			{ role: "user", content: "" },
+		])[0].content, "[empty]");
+	});
+
+	it("keeps a run carrying an image as blocks", () => {
+		const result = convert([
+			{ role: "user", content: [
+				{ type: "text", text: "describe this" },
+				{ type: "image", mimeType: "image/png", data: "aW1hZ2U=" },
+			] },
+			{ role: "user", content: "(attachment preview: [#image 1])" },
+		]);
+		assert.equal(result.length, 1);
+		assert.deepEqual(result[0].content, [
+			{ type: "text", text: "describe this" },
+			{ type: "image", source: { type: "base64", media_type: "image/png", data: "aW1hZ2U=" } },
+			{ type: "text", text: "(attachment preview: [#image 1])" },
+		]);
 	});
 });
 

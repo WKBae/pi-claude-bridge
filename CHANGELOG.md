@@ -1,5 +1,9 @@
 # Changelog
 
+## UNRELEASED
+
+- **Fix: rebuilt sessions keep a multi-message turn as one prompt** — the provider sends a turn's consecutive user messages (a prompt plus a message an extension adds to it) to Claude Code as one prompt, but a session rebuild imported them as separate records, which Claude Code merged into one block per message. The rebuilt prompt then differed from the cached one from that turn on. The rebuild now builds each run with the same code as the live prompt.
+
 ## 0.9.3 — 2026-10-13
 
 - **Remove: compaction and branch-summary takeovers (#189)** — pi runs them natively; the bridge routes summary calls to its isolated path. Other compaction extensions should now work. Resolves #115. Thanks @sonSunnoi.

@@ -84,6 +84,15 @@ describe("rebuilds extend the transcript instead of rewriting it", () => {
 		for (const n of lengths) assertPrefix(transcript(corpus.slice(0, n)), full, `history[0..${n}]`);
 	});
 
+	it("a settled prefix never ends inside a run of user messages", () => {
+		const lengths = settledPrefixes([
+			{ role: "user", content: "ask" },
+			{ role: "user", content: "note" },
+			{ role: "assistant", content: [{ type: "text", text: "answer" }] },
+		]);
+		assert.deepEqual(lengths, [2, 3]);
+	});
+
 	it("a settled prefix survives every longer history, mid-turn truncation included", () => {
 		for (const n of settledPrefixes(exotic)) {
 			const shorter = transcript(exotic.slice(0, n));

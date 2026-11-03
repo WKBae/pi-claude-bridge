@@ -144,6 +144,10 @@ export class PromptCaptures {
 	 * files, skills, custom prompt or append text, and say so only in a debug line —
 	 * silently discarding policy the user wrote down. A failed turn is recoverable;
 	 * a turn that quietly ignored its instructions is not.
+	 *
+	 * `canResolve` answers whether this call would succeed. A route added here belongs
+	 * there too, or a caller deciding whether to forward a prompt will disagree with
+	 * the call that forwards it.
 	 */
 	resolveOrDerive(systemPrompt?: string): PromptCapture | undefined {
 		if (!systemPrompt) return undefined;
@@ -208,6 +212,15 @@ export class PromptCaptures {
 		// projectCustom substitutes the embedded captures in place and preserves every
 		// byte between and around them.
 		return { assembledPrompt: systemPrompt, custom: systemPrompt, contextFiles: [], skills: [], inherited: embedded };
+	}
+
+	/** Whether `resolveOrDerive` would return a capture for this prompt instead of throwing.
+	 *  Read-only: no recency update and no diagnostic, so a routing check can ask about a
+	 *  prompt that was never pi's without disturbing the registry or the debug log. */
+	canResolve(systemPrompt: string): boolean {
+		if (this.captures.has(systemPrompt)) return true;
+		if (this.reachableCaptures().some((node) => node.assembledPrompt === systemPrompt)) return true;
+		return this.findInheritedPrompts(systemPrompt, systemPrompt).length > 0;
 	}
 
 	get size(): number {
@@ -368,17 +381,7 @@ function projectCapture(
 }
 
 function assertSendablePrompt(parts: readonly PromptPart[], capture: PromptCapture): void {
-	const findings: string[] = [];
-	for (const { label, text } of parts) {
-		const offset = preambleAtLineStart(text);
-		if (offset !== -1) {
-			findings.push(`pi's preamble ("${PI_PREAMBLE}") in ${label}, at offset ${offset} of ${text.length} chars`);
-		}
-		// The pair has to co-occur in one part; the two phrases split across parts are not detected.
-		if (ANTHROPIC_THIRD_PARTY_TRIGGERS.every((trigger) => text.includes(trigger))) {
-			findings.push(`${ANTHROPIC_THIRD_PARTY_TRIGGERS.join(" and ")} in ${label}`);
-		}
-	}
+	const findings = parts.flatMap(({ label, text }) => unsendableFindings(text, label));
 	if (findings.length === 0) return;
 
 	throw new Error([
@@ -391,6 +394,24 @@ function assertSendablePrompt(parts: readonly PromptPart[], capture: PromptCaptu
 		"  If it is your own text, reword or remove it. CLAUDE_BRIDGE_DEBUG=1 writes the full prompt to",
 		`  ${debugLogPath()}.`,
 	].join("\n"));
+}
+
+/** The parts of a prompt Claude Code's Anthropic path reads as a third-party app, named
+ *  for a diagnostic; empty when the prompt is safe to send. Used by `assertSendablePrompt`
+ *  for prompts the bridge assembled itself, and by the routing check for a prompt an
+ *  extension brought along — the same text trips the same gate whichever path carries it,
+ *  and the one-shot route must not be a way around the refusal. */
+export function unsendableFindings(text: string, label: string): string[] {
+	const findings: string[] = [];
+	const offset = preambleAtLineStart(text);
+	if (offset !== -1) {
+		findings.push(`pi's preamble ("${PI_PREAMBLE}") in ${label}, at offset ${offset} of ${text.length} chars`);
+	}
+	// The pair has to co-occur in one part; the two phrases split across parts are not detected.
+	if (ANTHROPIC_THIRD_PARTY_TRIGGERS.every((trigger) => text.includes(trigger))) {
+		findings.push(`${ANTHROPIC_THIRD_PARTY_TRIGGERS.join(" and ")} in ${label}`);
+	}
+	return findings;
 }
 
 /** Offset of pi's preamble at the start of a line, or -1. Mid-line mentions are someone

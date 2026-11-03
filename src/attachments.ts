@@ -37,7 +37,9 @@ const CONTENT_BEARING = new Set(["file"]);
 // `total_tokens_reminder` is also written after every tool result, hanging off the
 // tool-result record. Dropped there, the rebuilt request loses the `<total_tokens>`
 // system message that followed the result, and everything from that point on
-// misses the cache.
+// misses the cache. `silent_turn_reminder` hangs off a tool result the same way,
+// written when the model has gone a while without telling the user anything;
+// CC also counts the ones already in history to decide when to send the next.
 //
 // `instructions` is the memory/instruction-file block (auto-memory MEMORY.md, and
 // project instruction files when CC loads them). It only exists when the folder has
@@ -59,6 +61,7 @@ const SESSION_CONTEXT = new Set([
 	"model",
 	"output_style_instructions",
 	"total_tokens_reminder",
+	"silent_turn_reminder",
 	"output_style",
 	"session_context",
 	"date",

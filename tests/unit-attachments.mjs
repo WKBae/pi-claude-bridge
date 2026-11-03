@@ -99,6 +99,18 @@ describe("collectCarriedAttachments", () => {
 		assert.ok(carried.every((c) => c.toolUseId === "toolu_a" && c.userOrdinal === undefined));
 	});
 
+	it("keeps the reminder CC writes after a long silent stretch on the tool result it followed", () => {
+		// Dropped, the rebuilt request loses that system message and misses the cache
+		// from there on, and CC no longer counts the reminder it already sent.
+		const carried = collectCarriedAttachments([
+			user("u1", "first"),
+			toolResultUser("r1", "toolu_a"),
+			attach("a1", "r1", "silent_turn_reminder"),
+		]);
+		assert.deepEqual(carried.map((c) => c.attachment.type), ["silent_turn_reminder"]);
+		assert.equal(carried[0].toolUseId, "toolu_a");
+	});
+
 	it("ignores an attachment whose parent is not a prompt", () => {
 		const carried = collectCarriedAttachments([
 			user("u1", "first"),

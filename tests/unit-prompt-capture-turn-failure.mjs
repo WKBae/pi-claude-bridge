@@ -25,13 +25,16 @@ const { default: activate, __test } = await import("../src/index.js");
 const { PI_PREAMBLE } = await import("../src/prompt-capture.js");
 
 let providerConfig;
+const handlers = {};
 activate({
-	on: () => {},
+	on: (name, fn) => { (handlers[name] ??= []).push(fn); },
 	registerProvider: (_name, config) => { providerConfig = config; },
 	registerTool: () => {},
 	registerEntryRenderer: () => {},
 });
 const model = providerConfig.models[0];
+// A session the bridge has seen, so the refusals below cover a real pi turn.
+for (const fn of handlers.turn_start) fn({}, { sessionManager: { getSessionId: () => "pi-session" }, getSystemPrompt: () => undefined });
 const turn = (systemPrompt) => providerConfig.streamSimple(
 	model,
 	{ systemPrompt, messages: [{ role: "user", content: "hi", timestamp: 0 }], tools: [] },

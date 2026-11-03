@@ -4,11 +4,12 @@
  * shape, never from a flat thinking_tokens or a reasoning_tokens field; reasoning
  * tokens stay out of totalTokens (they are a subset of output_tokens); cachePct
  * divides by zero-safe prompt tokens; and a partial usage frame only overwrites
- * the counters it actually carries.
+ * the counters it actually carries. lastContextUsage follows pi's own context
+ * accounting when it picks the usage a rebuilt transcript is stamped with.
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { updateUsage } from "../src/usage.js";
+import { lastContextUsage, updateUsage } from "../src/usage.js";
 
 const model = {
 	api: "anthropic-messages", provider: "anthropic", id: "claude-haiku-4-5",
@@ -154,5 +155,44 @@ describe("updateUsage", () => {
 		// or the debug line reprints a stale count on every later frame.
 		assert.equal(report.reasoning, undefined);
 		assert.equal(output.usage.reasoning, 40);
+	});
+});
+
+describe("lastContextUsage", () => {
+	const user = (content) => ({ role: "user", content, timestamp: 0 });
+	const assistant = (usage, stopReason = "stop") => ({
+		role: "assistant", content: [{ type: "text", text: "ok" }], stopReason, timestamp: 0,
+		usage: { output: 10, cacheRead: 0, cacheWrite: 0, ...usage, totalTokens: 0 },
+	});
+
+	it("maps the latest assistant's usage onto Claude Code's counters", () => {
+		const measured = lastContextUsage([
+			user("a"), assistant({ input: 1 }), user("b"), assistant({ input: 3, cacheRead: 900, cacheWrite: 40 }), user("c"),
+		]);
+		assert.deepEqual(measured, {
+			usage: { input_tokens: 3, output_tokens: 10, cache_read_input_tokens: 900, cache_creation_input_tokens: 40 },
+			index: 3,
+		});
+	});
+
+	it("skips aborted, errored and zero-usage turns", () => {
+		const measured = lastContextUsage([
+			user("a"), assistant({ input: 5 }),
+			assistant({ input: 9 }, "aborted"), assistant({ input: 9 }, "error"), assistant({ input: 0, output: 0 }),
+		]);
+		assert.equal(measured?.usage.input_tokens, 5);
+		assert.equal(measured?.index, 1);
+	});
+
+	// After compaction the kept assistants measured the context before it, which can sit
+	// at the blocking limit; stamping that would make Claude Code refuse the compacted session.
+	it("ignores assistants from before the latest compaction summary", () => {
+		const summary = [{ type: "text", text: "The conversation history before this point was compacted into the following summary:\n\n<summary>\nx\n</summary>" }];
+		assert.equal(lastContextUsage([assistant({ input: 190_000 }), user(summary), user("next")]), undefined);
+		assert.equal(lastContextUsage([user(summary), assistant({ input: 4 })])?.usage.input_tokens, 4);
+	});
+
+	it("returns undefined when no assistant measured anything", () => {
+		assert.equal(lastContextUsage([user("a")]), undefined);
 	});
 });

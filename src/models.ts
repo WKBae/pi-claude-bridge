@@ -19,9 +19,6 @@ function isDatedAlias(id: string): boolean {
 // sink below all known ones.
 const FAMILY_ORDER = ["fable", "opus", "sonnet", "haiku"];
 
-// Project pi-ai's model entries down to the fields pi's registerProvider expects,
-// newest generation first. Context-dependent display labels are applied after
-// plan/long-context config is known.
 // Version rank of a claude id, e.g. claude-opus-4-7 → ["opus", 4, 7]. Shared by
 // the display sort and resolveModel's newest-first partial tiebreak.
 function versionRank(id: string): { family: string; tuple: [number, number] } {
@@ -29,6 +26,12 @@ function versionRank(id: string): { family: string; tuple: [number, number] } {
 	return { family, tuple: [Number(major) || 0, Number(minor) || 0] };
 }
 
+// Project the catalog to registerProvider metadata, newest generation first.
+// updateUsage uses these public API rates for reference cost estimates, not
+// Claude Code subscription charges. promptCache is omitted to disable Pi's
+// replay-based cache warming; bridge refresh support has not been validated.
+// See tests/unit-model-provider-contracts.mjs for the installed Pi replay contract.
+// Display labels are applied after plan/long-context config is known.
 export function buildModels<T extends { id: string; [key: string]: any }>(piAiModels: T[]) {
 	return piAiModels
 		.filter((m) => typeof m.id === "string" && !isDatedAlias(m.id))
@@ -44,14 +47,13 @@ export function buildModels<T extends { id: string; [key: string]: any }>(piAiMo
 			if (ra[1] !== rb[1]) return rb[1] - ra[1];
 			return a.id.localeCompare(b.id);
 		})
-		// Forward thinkingLevelMap so pi-ai's per-model overrides (e.g. opus-4-8
-		// mapping xhigh→xhigh and max→max) are visible to the effort lookup.
-		.map(({ id, name, reasoning, input, contextWindow, maxTokens, thinkingLevelMap }) => ({
+		// Forward pricing (including tiers) and per-model thinking metadata.
+		.map(({ id, name, reasoning, input, contextWindow, maxTokens, thinkingLevelMap, cost }) => ({
 			id,
 			name,
 			reasoning, input, contextWindow, maxTokens,
 			thinkingLevelMap,
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			cost,
 		}));
 }
 

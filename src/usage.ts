@@ -18,6 +18,7 @@ export type SdkUsage = {
 	output_tokens?: number | null;
 	cache_read_input_tokens?: number | null;
 	cache_creation_input_tokens?: number | null;
+	cache_creation?: { ephemeral_1h_input_tokens?: number | null } | null;
 	output_tokens_details?: { thinking_tokens?: number | null } | null;
 };
 
@@ -41,6 +42,13 @@ export function updateUsage(output: AssistantMessage, usage: SdkUsage, model: Mo
 	if (usage.output_tokens != null) output.usage.output = usage.output_tokens;
 	if (usage.cache_read_input_tokens != null) output.usage.cacheRead = usage.cache_read_input_tokens;
 	if (usage.cache_creation_input_tokens != null) output.usage.cacheWrite = usage.cache_creation_input_tokens;
+	const cacheWrite1h = usage.cache_creation?.ephemeral_1h_input_tokens;
+	if (cacheWrite1h != null) output.usage.cacheWrite1h = cacheWrite1h;
+	// This is a subset of cacheWrite, retained across partial frames. A smaller
+	// replacement total must not leave a larger subset and negative short writes.
+	if (output.usage.cacheWrite1h != null) {
+		output.usage.cacheWrite1h = Math.min(output.usage.cacheWrite1h, output.usage.cacheWrite);
+	}
 	// A subset of output_tokens, never a separate addend in the total or in cost.
 	const reasoning = usage.output_tokens_details?.thinking_tokens;
 	if (reasoning != null) output.usage.reasoning = reasoning;

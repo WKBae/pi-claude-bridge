@@ -16,16 +16,16 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { QueryContext } from "../src/query-state.js";
+import { buildModels } from "../src/models.js";
+import { getModels } from "@earendil-works/pi-ai/compat";
 
 const { __test } = await import("../src/index.js");
 
-// `cost` matters: a recorded stream carries real usage, so consumeQuery reaches
-// pi-ai's cost calculation, which the hand-built streams never exercise. Zeros are
-// what buildModels ships (src/models.ts) since Claude Code billing is per-plan.
-const model = {
-	api: "anthropic-messages", provider: "anthropic", id: "claude-haiku-4-5",
-	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-};
+// Exercise the same catalog projection as provider registration. Recorded SDK
+// usage must replace the zero cost initializers with public API cost estimates.
+const projectedModel = buildModels(getModels("anthropic")).find((m) => m.id === "claude-haiku-4-5");
+assert.ok(projectedModel, "Anthropic catalog contains the replay model");
+const model = { ...projectedModel, api: "claude-bridge", provider: "claude-bridge" };
 
 function fixture(name) {
 	const path = new URL(`./fixtures/sdk-streams/${name}.jsonl`, import.meta.url);
@@ -38,6 +38,7 @@ async function replay(name, { toolNames = ["read"] } = {}) {
 	const c = new QueryContext();
 	c.currentPiStream = { push: (e) => events.push(e), end: () => events.push({ type: "end" }) };
 	c.resetTurnState(model);
+	assert.equal(c.turnOutput.usage.cost.total, 0, "new turn has no accumulated cost");
 	// The map the provider path builds from the served tool list: SDK name → pi name.
 	const customToolNameToPi = new Map(toolNames.map((n) => [`mcp__custom-tools__${n}`, n]));
 
@@ -83,6 +84,30 @@ describe("replaying a recorded text-only turn", () => {
 		assert.ok(ctx.turnOutput.usage.output > 0, "output tokens");
 		assert.ok(ctx.turnOutput.usage.input + ctx.turnOutput.usage.cacheRead + ctx.turnOutput.usage.cacheWrite > 0, "prompt tokens");
 		assert.match(capturedSessionId ?? "", /^[0-9a-f-]{36}$/);
+	});
+
+	it("emits catalog-priced usage after starting with zero accumulated cost", async () => {
+		const { ctx, events } = await replay("text");
+		// The provider finalizes the stream after consumeQuery returns.
+		__test.finalizeCurrentStream(ctx, ctx.turnOutput.stopReason);
+		const done = events.find((event) => event.type === "done");
+		assert.ok(done, "recorded turn emits a terminal message");
+		assert.equal(done.message, ctx.turnOutput);
+		// Exact counters from the single-cycle text fixture, excluding its 39
+		// thinking tokens (already included in the 47 output tokens).
+		assert.equal(done.message.usage.totalTokens, 10 + 47 + 10088);
+		assert.equal(done.message.usage.cacheWrite1h, 10088, "fixture writes only one-hour cache tokens");
+		const expected = {
+			input: 10 * model.cost.input / 1_000_000,
+			output: 47 * model.cost.output / 1_000_000,
+			cacheRead: 0,
+			cacheWrite: 10088 * model.cost.input * 2 / 1_000_000,
+		};
+		assert.ok(expected.input > 0 && expected.output > 0 && expected.cacheWrite > 0);
+		for (const [key, value] of Object.entries(expected)) {
+			assert.ok(Math.abs(done.message.usage.cost[key] - value) < 1e-12, key);
+		}
+		assert.ok(Math.abs(done.message.usage.cost.total - Object.values(expected).reduce((a, b) => a + b, 0)) < 1e-12);
 	});
 });
 

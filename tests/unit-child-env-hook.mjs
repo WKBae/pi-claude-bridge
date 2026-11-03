@@ -262,7 +262,7 @@ describe("bridge session lifecycle and the child-env binding", () => {
 		const events = bus();
 		// Its own activation; whether it registers the provider or defers to
 		// session_start (modelRegistry already has it), the binding is the same.
-		activate({ on: (name, h) => { (handlers[name] ??= []).push(h); }, events, registerProvider: () => {}, registerTool: () => {} });
+		activate({ on: (name, h) => { (handlers[name] ??= []).push(h); }, events, registerProvider: () => {}, registerTool: () => {}, registerEntryRenderer: () => {} });
 		const emit = (name, event, id) => {
 			const ctx = { cwd: process.cwd(), sessionManager: { getSessionId: () => id }, modelRegistry: { getProvider: () => ({}) } };
 			for (const h of handlers[name] ?? []) h(event, ctx);

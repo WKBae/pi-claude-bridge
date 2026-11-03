@@ -12,7 +12,7 @@ const mod = await import("../src/index.js");
 const { __test } = mod;
 const handlers = {};
 let provider;
-mod.default({ on: (name, fn) => { (handlers[name] ??= []).push(fn); }, registerProvider: (_id, value) => { provider = value; }, registerTool: () => {} });
+mod.default({ on: (name, fn) => { (handlers[name] ??= []).push(fn); }, registerProvider: (_id, value) => { provider = value; }, registerTool: () => {}, registerEntryRenderer: () => {} });
 const model = provider.models.find((m) => m.id.includes("haiku")) ?? provider.models[0];
 const user = (content) => ({ role: "user", content, timestamp: 1 });
 const say = (text) => ({ role: "assistant", content: [{ type: "text", text }], provider: model.provider, timestamp: 1 });

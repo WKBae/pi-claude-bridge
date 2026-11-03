@@ -17,7 +17,7 @@ const mod = await import("../src/index.js");
 const { __test } = mod;
 let provider;
 const handlers = {};
-mod.default({ on: (name, fn) => { (handlers[name] ??= []).push(fn); }, registerProvider: (_id, value) => { provider = value; }, registerTool: () => {} });
+mod.default({ on: (name, fn) => { (handlers[name] ??= []).push(fn); }, registerProvider: (_id, value) => { provider = value; }, registerTool: () => {}, registerEntryRenderer: () => {} });
 const model = provider.models[0];
 const tools = [{ name: "read", description: "read", parameters: { type: "object", properties: {} } }];
 const user = (content) => ({ role: "user", content, timestamp: 1 });
@@ -282,7 +282,7 @@ it("a reloaded module shares state and stopping writers, and the old finalizer n
 	for (const fn of handlers.session_shutdown) fn({}, { sessionManager: { getSessionId: () => "pi" } });
 	const fresh = await import(`../src/index.js?reload=${Date.now()}`);
 	let freshProvider;
-	fresh.default({ on() {}, registerProvider: (_id, value) => { freshProvider = value; }, registerTool() {} });
+	fresh.default({ on() {}, registerProvider: (_id, value) => { freshProvider = value; }, registerTool() {}, registerEntryRenderer() {} });
 	fresh.__test.setQuery(fakeQuery);
 	assert.strictEqual(fresh.__test.getSharedSession("pi"), committed, "the newer memory state, not the empty disk");
 	const waiting = new AbortController();
@@ -552,7 +552,7 @@ it("a failed state save ends the turn with that error and is fatal, never retrie
 		import { join } from "node:path";
 		const mod = await import(${JSON.stringify(new URL("../src/index.ts", import.meta.url).href)});
 		let provider;
-		mod.default({ on() {}, registerProvider: (_id, value) => { provider = value; }, registerTool() {} });
+		mod.default({ on() {}, registerProvider: (_id, value) => { provider = value; }, registerTool() {}, registerEntryRenderer() {} });
 		const model = provider.models[0];
 		mod.__test.getSharedSession("pi");
 		const file = "s-" + createHash("sha256").update("pi", "utf16le").digest("hex") + ".json";
@@ -593,7 +593,7 @@ it("an unexpected session id ends the turn, commits nothing, and is fatal", asyn
 		import { join } from "node:path";
 		const mod = await import(${JSON.stringify(new URL("../src/index.ts", import.meta.url).href)});
 		let provider;
-		mod.default({ on() {}, registerProvider: (_id, value) => { provider = value; }, registerTool() {} });
+		mod.default({ on() {}, registerProvider: (_id, value) => { provider = value; }, registerTool() {}, registerEntryRenderer() {} });
 		const model = provider.models[0];
 		const file = join(process.env.PI_CODING_AGENT_DIR, "claude-bridge", "sessions", "s-" + createHash("sha256").update("pi", "utf16le").digest("hex") + ".json");
 		mod.__test.setQuery(({ prompt }) => {

@@ -4,6 +4,7 @@
 import type { Message as PiMessage } from "@earendil-works/pi-ai";
 import type { Message as SessionMessage } from "cc-session-io";
 import { pascalCase } from "change-case";
+import { toolResultToMcpContent } from "./extract-tool-results.js";
 import { MCP_TOOL_PREFIX } from "./skills.js";
 
 export const PROVIDER_ID = "claude-bridge";
@@ -67,9 +68,41 @@ export function messageContentToText(
 	return hasText ? parts.join("\n") : "";
 }
 
-// Tool results are flattened to text, which is how Claude Code stores most of
-// them. Images are the exception: they have no text form, so a result carrying
-// one keeps the block array shape instead (also what CC writes for screenshots).
+// A tool served over MCP reaches Claude Code as toolResultToMcpContent's blocks,
+// and CC records a successful result's blocks as they are: an array even for
+// plain text, images in Anthropic's base64 form. A result with no non-blank
+// text becomes CC's "(<tool> completed with no output)" marker instead
+// (isToolResultContentEmpty in CC's utils/toolResultStorage.ts). Rebuilding
+// those exact blocks keeps a rebuilt session on the prefix the live child
+// cached; the flattened string reads the same to the model but misses it.
+function mcpToolResultContent(
+	content: string | Array<{ type: string; text?: string; data?: string; mimeType?: string }>,
+	sdkToolName: string,
+): string | Array<Record<string, unknown>> {
+	const blocks = toolResultToMcpContent(content).map((b) =>
+		b.type === "image" ? { type: "image" as const, source: { type: "base64", media_type: b.mimeType, data: b.data } } : b,
+	);
+	if (blocks.every((b) => b.type === "text" && b.text.trim() === "")) return `(${sdkToolName} completed with no output)`;
+	return blocks;
+}
+
+// CC turns an MCP error into a thrown error carrying the first block's text
+// (services/mcp/client.ts) and records formatError's string for it
+// (utils/toolErrors.ts): trimmed, a fallback when blank, the middle cut past
+// 10000 characters.
+function mcpToolErrorContent(
+	content: string | Array<{ type: string; text?: string; data?: string; mimeType?: string }>,
+): string {
+	const first = toolResultToMcpContent(content)[0];
+	const text = (first.type === "text" ? first.text : "Unknown error").trim() || "Command failed with no output";
+	if (text.length <= 10000) return text;
+	return `${text.slice(0, 5000)}\n\n... [${text.length - 10000} characters truncated] ...\n\n${text.slice(-5000)}`;
+}
+
+// Results of Claude Code's own tools (the AskClaude path) are flattened to
+// text, which is how CC stores most of those. Images are the exception:
+// they have no text form, so a result carrying one keeps the block array shape
+// instead (also what CC writes for screenshots).
 function toolResultContent(
 	content: string | Array<{ type: string; text?: string; data?: string; mimeType?: string }>,
 ): string | Array<Record<string, unknown>> {
@@ -206,7 +239,13 @@ export function convertPiMessages(
 			// reorderAttachmentsForAPI (claude-code-rip src/utils/messages.ts:1481)
 			// bubbles attachments up to the nearest assistant or tool_result message
 			// and re-inserts them after it. The on-disk form differs, the order does not.
-			const block = { type: "tool_result", tool_use_id: sanitizeToolId(msg.toolCallId, sanitizedIds), content: toolResultContent(msg.content), is_error: msg.isError };
+			// With a map every tool is served over MCP (see mapPiToolNameToSdk).
+			const content = !customToolNameToSdk
+				? toolResultContent(msg.content)
+				: msg.isError
+					? mcpToolErrorContent(msg.content)
+					: mcpToolResultContent(msg.content, mapPiToolNameToSdk(msg.toolName, customToolNameToSdk));
+			const block = { type: "tool_result", tool_use_id: sanitizeToolId(msg.toolCallId, sanitizedIds), content, is_error: msg.isError };
 			if (turnResults) {
 				turnResults.content.push(block);
 			} else {

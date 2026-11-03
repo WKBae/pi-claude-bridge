@@ -1,5 +1,9 @@
 # Changelog
 
+## UNRELEASED
+
+- **Fix: rebuilt tool results missed the prompt cache** — a rebuild flattened every text-only tool result to a string, but Claude Code records a pi tool's result (served over MCP) as the text blocks it received, so the rebuilt request diverged from the cached prefix at the first result the previous child recorded live. Successful results now rebuild as those blocks, with Claude Code's `(<tool> completed with no output)` marker for blank ones, and errors as Claude Code's error text. Covered by `tests/unit-import.mjs`.
+
 ## 0.9.3 — 2026-10-13
 
 - **Remove: compaction and branch-summary takeovers (#189)** — pi runs them natively; the bridge routes summary calls to its isolated path. Other compaction extensions should now work. Resolves #115. Thanks @sonSunnoi.

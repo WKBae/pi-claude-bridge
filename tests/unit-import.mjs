@@ -324,8 +324,9 @@ describe("message structure", () => {
 		]);
 	});
 
-	// The string shape is what CC writes for text-only results; switching to
-	// blocks unconditionally would diverge from it and perturb the cache key.
+	// The string shape is what CC writes for its own tools' text-only results
+	// (the AskClaude path, no map); switching to blocks there would diverge from
+	// it and perturb the cache key.
 	it("toolResult without an image stays a flat string", () => {
 		const msgs = [
 			{ role: "toolResult", toolCallId: "x", content: [{ type: "text", text: "just text" }] },
@@ -345,6 +346,46 @@ describe("message structure", () => {
 			{ type: "text", text: "[document]" },
 			{ type: "image", source: { type: "base64", media_type: "image/png", data: "BASE64DATA" } },
 		]);
+	});
+
+	// On the provider path every tool is served over MCP, and Claude Code records
+	// a successful MCP result as the blocks it received — never flattened.
+	describe("served over MCP", () => {
+		const served = new Map([["bash", "mcp__custom-tools__bash"]]);
+		const result = (content, extra = {}) =>
+			convert([{ role: "toolResult", toolCallId: "x", toolName: "bash", content, ...extra }], served)[0].content[0];
+
+		it("keeps a text-only result as blocks", () => {
+			assert.deepEqual(result([{ type: "text", text: "(no output)" }]).content, [{ type: "text", text: "(no output)" }]);
+		});
+
+		it("keeps each text block and drops empty ones", () => {
+			assert.deepEqual(
+				result([{ type: "text", text: "a" }, { type: "text", text: "" }, { type: "text", text: "b" }]).content,
+				[{ type: "text", text: "a" }, { type: "text", text: "b" }],
+			);
+		});
+
+		it("keeps images in Anthropic's base64 form", () => {
+			assert.deepEqual(result([{ type: "text", text: "captured" }, { type: "image", data: "BASE64DATA", mimeType: "image/png" }]).content, [
+				{ type: "text", text: "captured" },
+				{ type: "image", source: { type: "base64", media_type: "image/png", data: "BASE64DATA" } },
+			]);
+		});
+
+		it("writes Claude Code's marker for a blank result", () => {
+			assert.equal(result([{ type: "text", text: "\n" }]).content, "(mcp__custom-tools__bash completed with no output)");
+			assert.equal(result([]).content, "(mcp__custom-tools__bash completed with no output)");
+		});
+
+		it("records an error as Claude Code's error text", () => {
+			const error = (content) => result(content, { isError: true }).content;
+			assert.equal(error([{ type: "text", text: " oh no\n" }, { type: "text", text: "more" }]), "oh no");
+			assert.equal(error([{ type: "text", text: "  " }]), "Command failed with no output");
+			assert.equal(error([{ type: "image", data: "BASE64DATA", mimeType: "image/png" }]), "Unknown error");
+			const long = error([{ type: "text", text: "a".repeat(6000) + "b".repeat(6000) }]);
+			assert.equal(long, `${"a".repeat(5000)}\n\n... [2000 characters truncated] ...\n\n${"b".repeat(5000)}`);
+		});
 	});
 
 	it("toolResult with only an image keeps the image", () => {
